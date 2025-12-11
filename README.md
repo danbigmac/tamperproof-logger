@@ -23,6 +23,9 @@ Example usage:
 Build it:
 
 make
+
+Print usage:
+
 ./build/logger
 
 Add an entry:
