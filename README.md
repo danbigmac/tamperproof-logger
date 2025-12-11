@@ -29,13 +29,7 @@ Add an entry:
 
 ./build/logger add score 23 "Hit a three-pointer"
 
-This command:
-Loads (or generates) signing keys
-Creates a new log entry
-Chains it to the previous entry
-Computes a hash
-Signs it
-Appends it to data/game.log
+This command loads (or generates) signing keys, creates a new log entry, chains it to the previous entry, computes a hash, signs it, appends it to data/game.log.
 
 Print entries:
 
@@ -54,17 +48,16 @@ Verify the entire log:
 
 ./build/logger verify
 
-If the log has not been tampered with:
-Log verified: all entries valid.
+If the log has not been tampered with, you'll see output: "Log verified: all entries valid."
 
 If you flip even one byte in the file, verification will detect it immediately.
 
 
 The built-in event structure uses:
 
-timestamp
-event_type (e.g., SCORE / FOUL / SUB)
-player_id
+timestamp, 
+event_type (e.g., SCORE / FOUL / SUB), 
+player_id, 
 description
 
 This made sense for the sports-related experiments I wanted to play with - but the logger itself is generic and can support any event format. You can replace the fields, add new ones, or build an entirely different record schema without changing the core logging/verification pipeline.
