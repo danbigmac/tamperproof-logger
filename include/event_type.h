@@ -12,6 +12,7 @@ typedef enum {
     EVENT_ASSIST,
     EVENT_TIMEOUT,
     EVENT_INJURY,
+    EVENT_KEY_ROTATION,
     // add more as needed...
 } EventType;
 

@@ -38,7 +38,7 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "add") == 0) {
 
         // Load or generate keys
-        if (load_or_create_keys("data/public.key", "data/private.key") != 0) {
+        if (load_or_create_keys("data/root_public.key", "data/private.key") != 0) {
             fprintf(stderr, "Could not load or create keypair\n");
             return 1;
         }
@@ -79,7 +79,7 @@ int main(int argc, char **argv)
     else if (strcmp(cmd, "verify") == 0) {
 
         // Load or generate keys
-        if (load_or_create_keys("data/public.key", "data/private.key") != 0) {
+        if (load_or_create_keys("data/root_public.key", "data/private.key") != 0) {
             fprintf(stderr, "Could not load or create keypair\n");
             return 1;
         }
@@ -94,6 +94,28 @@ int main(int argc, char **argv)
             printf("Log verification FAILED.\n");
 
         return rc;
+    }
+
+    //
+    // -------------------------------
+    // Command: ROTATE_KEYS
+    // -------------------------------
+    //
+    else if (strcmp(cmd, "rotate_keys") == 0) {
+
+        // Make sure there is at least an initial keypair.
+        if (load_or_create_keys("data/root_public.key", "data/private.key") != 0) {
+            fprintf(stderr, "Could not load or create keypair\n");
+            return 1;
+        }
+
+        // Rotate keys: append KEY_ROTATION entry and write new private key.
+        if (logger_rotate_keys("data/game.log", "data/private.key") != 0) {
+            fprintf(stderr, "Key rotation failed\n");
+            return 1;
+        }
+        printf("Key rotation completed.\n");
+        return 0;
     }
 
     //

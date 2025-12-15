@@ -16,4 +16,8 @@ int logger_verify(const char *log_path);
 /* Prints entries in human-readable form */
 int logger_print(const char *log_path);
 
+/* Rotates the signing keys for the logger */
+int logger_rotate_keys(const char *log_path,
+                       const char *priv_path);
+
 #endif
