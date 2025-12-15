@@ -19,7 +19,7 @@ void test_hash_chain(void)
     // Tamper with file: flip a byte
     FILE *f = fopen(path, "r+b");
     TEST_ASSERT(f != NULL);
-    fseek(f, 50, SEEK_SET);
+    fseek(f, 70, SEEK_SET);
     fputc(0xFF, f);
     fclose(f);
 

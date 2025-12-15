@@ -12,8 +12,16 @@ int fileio_append_entry(const char *path, const LogEntry *entry)
 
     uint8_t buf[2048];
     size_t len = entry_serialize(entry, buf, sizeof(buf));
+    if (len == 0) {
+        fclose(f);
+        return -1;
+    }
 
-    fwrite(buf, 1, len, f);
+    if (fwrite(buf, 1, len, f) != len) {
+        fclose(f);
+        return -1;
+    }
+
     fclose(f);
     return 0;
 }
@@ -40,10 +48,25 @@ LogEntry *fileio_read_all(const char *path, size_t *count_out)
         uint8_t prefix_buf[ENTRY_LENGTH_PREFIX_SIZE];
         size_t n = fread(prefix_buf, 1, ENTRY_LENGTH_PREFIX_SIZE, f);
 
-        if (n == 0) break; // clean EOF
-        if (n != ENTRY_LENGTH_PREFIX_SIZE) break; // truncated prefix
+        if (n == 0) {
+            // clean EOF
+            break;
+        }
+        if (n != ENTRY_LENGTH_PREFIX_SIZE) {
+            // Truncated prefix -> corruption
+            free(entries);
+            fclose(f);
+            return NULL;
+        }
 
         uint32_t body_size = read_u32_le(prefix_buf);
+
+        // Safety guard against insane lengths (prevents OOM on corruption)
+        if (body_size > (1u << 20)) { // 1MB cap for now
+            free(entries);
+            fclose(f);
+            return NULL;
+        }
 
         //
         // Compute total entry size
@@ -54,7 +77,11 @@ LogEntry *fileio_read_all(const char *path, size_t *count_out)
         // Read entire remaining entry into a buffer
         //
         uint8_t *buf = malloc(total_size);
-        if (!buf) break;
+        if (!buf) {
+            free(entries);
+            fclose(f);
+            return NULL;
+        }
 
         // Copy prefix in place
         memcpy(buf, prefix_buf, ENTRY_LENGTH_PREFIX_SIZE);
@@ -62,10 +89,13 @@ LogEntry *fileio_read_all(const char *path, size_t *count_out)
         // Read body + footer
         if (fread(buf + ENTRY_LENGTH_PREFIX_SIZE, 1,
                   body_size + FOOTER_SIZE, f)
-            != body_size + FOOTER_SIZE)
+            != (body_size + FOOTER_SIZE))
         {
+            // Truncated entry -> corruption
             free(buf);
-            break;
+            free(entries);
+            fclose(f);
+            return NULL;
         }
 
         //
@@ -73,8 +103,11 @@ LogEntry *fileio_read_all(const char *path, size_t *count_out)
         //
         LogEntry e;
         if (entry_deserialize(&e, buf, total_size) != 0) {
+            // CRC/length/footer mismatch -> tampering or corruption
             free(buf);
-            break;
+            free(entries);
+            fclose(f);
+            return NULL;
         }
 
         free(buf);

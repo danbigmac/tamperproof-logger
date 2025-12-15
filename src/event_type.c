@@ -9,6 +9,7 @@ EventType parse_event_type(const char *s)
     if (strcasecmp(s, "foul")  == 0) return EVENT_FOUL;
     if (strcasecmp(s, "sub") == 0 ||
         strcasecmp(s, "substitution") == 0) return EVENT_SUB;
+    if (strcasecmp(s, "key_rotation") == 0) return EVENT_KEY_ROTATION;
 
     return EVENT_UNKNOWN;
 }
@@ -19,6 +20,7 @@ const char *event_type_name(EventType t)
         case EVENT_SCORE: return "SCORE";
         case EVENT_FOUL:  return "FOUL";
         case EVENT_SUB:   return "SUB";
+        case EVENT_KEY_ROTATION: return "KEY_ROTATION";
         default: return "UNKNOWN";
     }
 }

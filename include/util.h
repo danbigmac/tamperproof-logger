@@ -15,6 +15,12 @@ const char *get_arg(int argc, char **argv, int index);
 
 void util_print_hex(const uint8_t *data, size_t len);
 
+int decode_pubkey_hex(uint8_t *out, size_t out_max,
+                      const char *in, size_t in_len);
+
+int encode_pubkey_hex(char *out, size_t out_max,
+                      const uint8_t *pub, size_t pub_len);
+
 void write_u64_le(uint8_t *buf, uint64_t v);
 
 void write_u32_le(uint8_t *buf, uint32_t v);

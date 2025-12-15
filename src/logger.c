@@ -43,7 +43,10 @@ int logger_verify(const char *log_path)
 {
     size_t count = 0;
     LogEntry *entries = fileio_read_all(log_path, &count);
-    if (!entries) return -1;
+    if (!entries) {
+        fprintf(stderr, "logger_verify: no entries or failed to read log due to corruption or truncation\n");
+        return -1;
+    }
 
     for (size_t i = 0; i < count; i++) {
 
@@ -74,6 +77,29 @@ int logger_verify(const char *log_path)
         if (i > 0) {
             if (memcmp(entries[i].prev_hash, entries[i-1].entry_hash, HASH_SIZE) != 0) {
                 printf("Entry %zu chain broken: prev_hash mismatch\n", i);
+                free(entries);
+                return -1;
+            }
+        }
+
+        // Handle key rotation entries
+        if (entries[i].event_type == EVENT_KEY_ROTATION) {
+            // description field must contain new public key in hex
+            uint8_t new_pub[crypto_sign_PUBLICKEYBYTES];
+            int decoded = decode_pubkey_hex(
+                new_pub,
+                sizeof(new_pub),
+                entries[i].description,
+                entries[i].description_len
+            );
+            if (decoded != crypto_sign_PUBLICKEYBYTES) {
+                fprintf(stderr, "Invalid KEY_ROTATION entry at %zu (bad pubkey length)\n", i);
+                free(entries);
+                return -1;
+            }
+            // Switch to new public key from rotation event data for subsequent verifications
+            if (set_public_key(NULL, new_pub, 0) != 0) {
+                fprintf(stderr, "logger_verify: failed to set new public key in memory\n");
                 free(entries);
                 return -1;
             }
@@ -109,5 +135,61 @@ int logger_print(const char *log_path)
     }
 
     free(entries);
+    return 0;
+}
+
+int logger_rotate_keys(const char *log_path,
+                       const char *priv_path)
+{
+    // Generate new keypair
+    uint8_t new_pub[crypto_sign_PUBLICKEYBYTES];
+    uint8_t new_priv[crypto_sign_SECRETKEYBYTES];
+
+    if (crypto_sign_keypair(new_pub, new_priv) != 0) {
+        fprintf(stderr, "logger_rotate_keys: crypto_sign_keypair failed\n");
+        return -1;
+    }
+
+    // Build description as hex-encoded new_pub
+    char desc[DESCRIPTION_MAX];
+    if (encode_pubkey_hex(desc, sizeof(desc), new_pub, crypto_sign_PUBLICKEYBYTES) != 0) {
+        fprintf(stderr, "logger_rotate_keys: description buffer too small\n");
+        return -1;
+    }
+
+    // Get prev_hash from last entry (or zeros if none)
+    uint8_t prev_hash[HASH_SIZE] = {0};
+    LogEntry last;
+    if (fileio_read_last(log_path, &last) != 0) {
+        fprintf(stderr, "logger_rotate_keys: failed to read last log entry\n");
+        return -1;
+    }
+    memcpy(prev_hash, last.entry_hash, HASH_SIZE);
+
+    // Create KEY_ROTATION log entry
+    LogEntry entry = entry_create(
+        util_timestamp_now(),
+        EVENT_KEY_ROTATION,
+        0,          // player_id not meaningful here
+        desc,
+        prev_hash
+    );
+
+    // Compute hash and sign with the *old* private key
+    entry_compute_hash(&entry, entry.entry_hash);
+    do_sign(entry.entry_hash, entry.signature);
+
+    if (fileio_append_entry(log_path, &entry) != 0) {
+        fprintf(stderr, "logger_rotate_keys: failed to append rotation entry\n");
+        return -1;
+    }
+
+    // Save new private key (root public key stays the same!)
+    if (set_private_key(priv_path, new_priv, 1) != 0) {
+        fprintf(stderr, "logger_rotate_keys: failed to save new private key\n");
+        return -1;
+    }
+
+    printf("Key rotation entry appended. New key will be used for future entries.\n");
     return 0;
 }
