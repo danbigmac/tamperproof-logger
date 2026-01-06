@@ -9,9 +9,9 @@ void test_hash_chain(void)
     const char *path = "data/test_chain.log";
     remove(path);
 
-    logger_add(path, 1, 11, "alpha");
-    logger_add(path, 2, 22, "beta");
-    logger_add(path, 3, 33, "gamma");
+    logger_add(path, 42 /*author*/, 12345ULL /*nonce*/, 1, 11, "alpha");
+    logger_add(path, 42 /*author*/, 12346ULL /*nonce*/, 2, 22, "beta");
+    logger_add(path, 42 /*author*/, 12347ULL /*nonce*/, 3, 33, "gamma");
 
     // Should verify successfully
     TEST_ASSERT(logger_verify(path) == 0);

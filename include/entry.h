@@ -8,10 +8,12 @@
 #define DESCRIPTION_MAX 256
 #define ENTRY_LENGTH_PREFIX_SIZE 4
 #define TIMESTAMP_SIZE 8
+#define AUTHOR_NODE_ID_SIZE 4
+#define NONCE_SIZE 8
 #define EVENT_TYPE_SIZE 4
 #define PLAYER_ID_SIZE 4
 #define DESCRIPTION_LEN_SIZE 2
-#define ENTRY_HEADER_SIZE (TIMESTAMP_SIZE + EVENT_TYPE_SIZE + PLAYER_ID_SIZE + DESCRIPTION_LEN_SIZE)
+#define ENTRY_HEADER_SIZE (TIMESTAMP_SIZE + AUTHOR_NODE_ID_SIZE + NONCE_SIZE + EVENT_TYPE_SIZE + PLAYER_ID_SIZE + DESCRIPTION_LEN_SIZE)
 #define HASH_SIZE 32
 #define ENTRY_LENGTH_SUFFIX_SIZE 4
 #define ENTRY_CRC32_SIZE 4
@@ -21,6 +23,8 @@ typedef struct {
     uint32_t entry_length_prefix;      // LENGTH OF BODY ONLY (not including prefix or footer)
 
     uint64_t timestamp;
+    uint32_t author_node_id;
+    uint64_t nonce;
     uint32_t event_type;
     uint32_t player_id;
     uint16_t description_len;
@@ -38,6 +42,8 @@ typedef struct {
 
 /* Construct a new entry in memory before hashing/signing */
 LogEntry entry_create(uint64_t timestamp,
+                      uint32_t author_node_id,
+                      uint64_t nonce,
                       uint32_t event_type,
                       uint32_t player_id,
                       const char *description,

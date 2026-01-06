@@ -9,8 +9,8 @@ void test_logger(void)
     const char *path = "data/test_logger.log";
     remove(path);
 
-    TEST_ASSERT(logger_add(path, 1, 5, "hello") == 0);
-    TEST_ASSERT(logger_add(path, 2, 9, "world") == 0);
+    TEST_ASSERT(logger_add(path, 42 /*author*/, 12345ULL /*nonce*/, 1, 5, "hello") == 0);
+    TEST_ASSERT(logger_add(path, 42 /*author*/, 12346ULL /*nonce*/, 2, 9, "world") == 0);
 
     TEST_ASSERT(logger_verify(path) == 0);
 

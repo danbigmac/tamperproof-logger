@@ -53,19 +53,19 @@ void test_key_rotation_end_to_end(void)
     TEST_ASSERT(load_or_create_keys(pub_path, priv_path) == 0);
 
     // Add entries under initial signing key
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SCORE, 23, "first key: score") == 0);
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_FOUL,  12, "first key: foul") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12345ULL /*nonce*/, (uint32_t)EVENT_SCORE, 23, "first key: score") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12346ULL /*nonce*/, (uint32_t)EVENT_FOUL,  12, "first key: foul") == 0);
 
     // Rotate keys: appends KEY_ROTATION entry, switches signing key
-    TEST_ASSERT(logger_rotate_keys(log_path, priv_path) == 0);
+    TEST_ASSERT(logger_rotate_keys(log_path, priv_path, 42 /*author*/, 12347ULL /*nonce*/) == 0);
 
     // Add entries under rotated signing key
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SCORE, 7, "second key: score") == 0);
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SUB,   8, "second key: sub") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12348ULL /*nonce*/, (uint32_t)EVENT_SCORE, 7, "second key: score") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12349ULL /*nonce*/, (uint32_t)EVENT_SUB,   8, "second key: sub") == 0);
 
     // Rotate a second time to prove multiple rotations work
-    TEST_ASSERT(logger_rotate_keys(log_path, priv_path) == 0);
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SCORE, 99, "third key: score") == 0);
+    TEST_ASSERT(logger_rotate_keys(log_path, priv_path, 42 /*author*/, 12350ULL /*nonce*/) == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12349ULL /*nonce*/, (uint32_t)EVENT_SCORE, 99, "third key: score") == 0);
 
     // IMPORTANT: reset in-memory public key to the ROOT key before verifying
     // Because logger_verify() uses do_verify() which relies on current in-memory pub key,

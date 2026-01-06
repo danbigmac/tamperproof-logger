@@ -10,6 +10,8 @@ void test_entry_roundtrip(void)
 
     LogEntry e1 = entry_create(
         123456789,
+        42 /*author*/,
+        12345ULL /*nonce*/,
         1,
         23,
         "hello world",

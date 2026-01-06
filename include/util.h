@@ -13,6 +13,14 @@ void util_hex(const uint8_t *data, size_t len, char *out_hex);
 /* Returns argv[i] if it exists, otherwise NULL. */
 const char *get_arg(int argc, char **argv, int index);
 
+// Returns the value after a flag like "--author".
+// Supports: "--author 3" and "--author=3"
+// Returns NULL if not present or missing a value.
+const char *get_flag_value(int argc, char **argv, const char *flag);
+
+// Returns 1 if a boolean flag like "--help" is present, else 0.
+int has_flag(int argc, char **argv, const char *flag);
+
 void util_print_hex(const uint8_t *data, size_t len);
 
 int decode_pubkey_hex(uint8_t *out, size_t out_max,

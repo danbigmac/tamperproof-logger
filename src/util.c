@@ -1,5 +1,6 @@
 #include <time.h>
 #include <stdio.h>
+#include <string.h>
 #include "util.h"
 
 uint64_t util_timestamp_now(void)
@@ -22,6 +23,51 @@ const char *get_arg(int argc, char **argv, int index)
     if (index < argc) {
         return argv[index];
     }
+    return NULL;
+}
+
+int has_flag(int argc, char **argv, const char *flag)
+{
+    if (!flag) {
+        fprintf(stderr, "has_flag: NULL flag\n");
+        return 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], flag) == 0) return 1;
+    }
+    return 0;
+}
+
+const char *get_flag_value(int argc, char **argv, const char *flag)
+{
+    if (!flag) {
+        fprintf(stderr, "get_flag_value: NULL flag\n");
+        return NULL;
+    }
+
+    size_t flen = strlen(flag);
+
+    for (int i = 1; i < argc; i++) {
+        // Exact match: --flag value
+        if (strcmp(argv[i], flag) == 0) {
+            if (i + 1 < argc) {
+                // If next token looks like another flag, treat as missing value
+                if (argv[i + 1][0] == '-') {
+                    fprintf(stderr, "get_flag_value: Missing value for flag '%s'\n", flag);
+                    return NULL;
+                }
+                return argv[i + 1];
+            }
+            fprintf(stderr, "get_flag_value: Missing value for flag '%s'\n", flag);
+            return NULL;
+        }
+        // Equals match: --flag=value
+        if (strncmp(argv[i], flag, flen) == 0 && argv[i][flen] == '=') {
+            const char *v = argv[i] + flen + 1;
+            return (*v != '\0') ? v : NULL;
+        }
+    }
+
     return NULL;
 }
 
@@ -70,19 +116,19 @@ int encode_pubkey_hex(char *out, size_t out_max,
 
 void write_u64_le(uint8_t *buf, uint64_t v) {
     for (int i = 0; i < 8; i++)
-        buf[i] = (v >> (8*i)) & 0xFF;
+        buf[i] = (uint8_t)((v >> (8*i)) & 0xFF);
 }
 
 void write_u32_le(uint8_t *buf, uint32_t v) {
-    buf[0] = v & 0xFF;
-    buf[1] = (v >> 8) & 0xFF;
-    buf[2] = (v >> 16) & 0xFF;
-    buf[3] = (v >> 24) & 0xFF;
+    buf[0] = (uint8_t)(v & 0xFF);
+    buf[1] = (uint8_t)((v >> 8) & 0xFF);
+    buf[2] = (uint8_t)((v >> 16) & 0xFF);
+    buf[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
 void write_u16_le(uint8_t *buf, uint16_t v) {
-    buf[0] = v & 0xFF;
-    buf[1] = (v >> 8) & 0xFF;
+    buf[0] = (uint8_t)(v & 0xFF);
+    buf[1] = (uint8_t)((v >> 8) & 0xFF);
 }
 
 uint64_t read_u64_le(const uint8_t *buf) {

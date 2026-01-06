@@ -4,10 +4,30 @@
 #include "event_type.h"
 #include "crypto.h"
 #include "util.h"
+#include <sodium.h>
 #include <stdio.h>
 #include <string.h>
 
+static uint64_t random_nonce_u64(void)
+{
+    uint64_t x = 0;
+    randombytes_buf(&x, sizeof(x));
+    return x;
+}
+
+int logger_add_auto(const char *log_path,
+                    uint32_t event_type,
+                    uint32_t player_id,
+                    const char *description)
+{
+    uint32_t author_node_id = 0;
+    uint64_t nonce = random_nonce_u64();
+    return logger_add(log_path, author_node_id, nonce, event_type, player_id, description);
+}
+
 int logger_add(const char *log_path,
+               uint32_t author_node_id,
+               uint64_t nonce,
                uint32_t event_type,
                uint32_t player_id,
                const char *description)
@@ -23,6 +43,8 @@ int logger_add(const char *log_path,
     // Create a new entry
     LogEntry entry = entry_create(
         util_timestamp_now(),
+        author_node_id,
+        nonce,
         event_type,
         player_id,
         description,
@@ -139,7 +161,9 @@ int logger_print(const char *log_path)
 }
 
 int logger_rotate_keys(const char *log_path,
-                       const char *priv_path)
+                       const char *priv_path,
+                       uint32_t author_node_id,
+                       uint64_t nonce)
 {
     // Generate new keypair
     uint8_t new_pub[crypto_sign_PUBLICKEYBYTES];
@@ -169,6 +193,8 @@ int logger_rotate_keys(const char *log_path,
     // Create KEY_ROTATION log entry
     LogEntry entry = entry_create(
         util_timestamp_now(),
+        author_node_id,
+        nonce,
         EVENT_KEY_ROTATION,
         0,          // player_id not meaningful here
         desc,
