@@ -21,6 +21,12 @@ int logger_add_auto(const char *log_path,
 /* Verifies entire log chain and signatures */
 int logger_verify(const char *log_path);
 
+/**
+ * Verify a log where entries may have different authors, using peers.conf
+ * as the source of truth for author_node_id -> pubkey mapping.
+ */
+int logger_verify_peers(const char *log_path, const char *peers_conf_path);
+
 /* Prints entries in human-readable form */
 int logger_print(const char *log_path);
 

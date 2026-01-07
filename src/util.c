@@ -17,6 +17,14 @@ void util_print_hex(const uint8_t *data, size_t len)
     printf("\n");
 }
 
+void util_print_hex_compact(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
+    printf("\n");
+}
+
 // Returns argv[i] if it exists, otherwise NULL.
 const char *get_arg(int argc, char **argv, int index)
 {

@@ -84,7 +84,9 @@ int idem_get(const IdemTable *t, uint32_t author, uint64_t nonce,
             return 0; // empty means not present
         }
         if (s->state == 1 && keys_equal(s, author, nonce)) {
-            if (out_hash) memcpy(out_hash, s->entry_hash, IDEM_HASH_SIZE);
+            if (out_hash) {
+                memcpy(out_hash, s->entry_hash, IDEM_HASH_SIZE);
+            }
             return 1;
         }
         idx = (idx + 1) & mask;

@@ -8,6 +8,7 @@ typedef struct Node Node;
 
 typedef struct {
     uint32_t node_id;
+    uint32_t leader_id;
     const char *listen_host;
     uint16_t listen_port;
 

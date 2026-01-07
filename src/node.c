@@ -72,6 +72,15 @@ static int node_seed_idempotency_from_log(Node *n, size_t max_entries_to_load)
     return 0;
 }
 
+// Return 1 if node is leader, 0 otherwise.
+static int node_is_leader(Node *n) {
+    if (!n) {
+        fprintf(stderr, "node_is_leader: null node pointer... so returning 0\n");
+        return 0;
+    }
+    return (n->cfg.node_id == n->cfg.leader_id);
+}
+
 // Best-effort broadcast of a serialized entry to peers.
 // Called AFTER the entry is appended locally.
 static void broadcast_entry(Node *n, const uint8_t *entry_bytes, size_t entry_len)
@@ -120,6 +129,62 @@ static int send_nack(int fd, uint8_t reason)
     return msg_send(fd, MSG_NACK, payload, sizeof(payload));
 }
 
+static int forward_submit_to_leader(Node *n, int client_fd,
+                                    const uint8_t *payload, size_t payload_len)
+{
+    // Find leader endpoint
+    const Peer *leader = peers_get(&n->peers, n->cfg.leader_id);
+    if (!leader) {
+        // We don't know where the leader is
+        fprintf(stderr, "forward_submit_to_leader: unknown leader node ID %u\n", n->cfg.leader_id);
+        return send_nack(client_fd, NACK_NOT_LEADER);
+    }
+
+    // Connect to leader
+    int leader_fd = net_connect_tcp(leader->host, leader->port);
+    if (leader_fd < 0) {
+        fprintf(stderr, "forward_submit_to_leader: failed to connect to leader %s:%u\n",
+                leader->host, leader->port);
+        return send_nack(client_fd, NACK_LEADER_UNREACH);
+    }
+
+    net_set_timeouts(leader_fd, 2000, 2000);
+
+    // Send submit to leader (same payload)
+    if (msg_send(leader_fd, MSG_SUBMIT, payload, payload_len) != 0) {
+        net_close(&leader_fd);
+        fprintf(stderr, "forward_submit_to_leader: msg_send to leader failed\n");
+        return send_nack(client_fd, NACK_LEADER_UNREACH);
+    }
+
+    // Receive leader response (expect ACK or NACK)
+    uint8_t rtype = 0, rver = 0;
+    uint8_t *rpayload = NULL;
+    size_t rpayload_len = 0;
+
+    MsgResult rr = msg_recv(leader_fd, &rtype, &rver, &rpayload, &rpayload_len);
+
+    net_close(&leader_fd);
+
+    if (rr != MSG_OK || rver != MSG_VERSION) {
+        free(rpayload);
+        fprintf(stderr, "forward_submit_to_leader: msg_recv from leader failed\n");
+        return send_nack(client_fd, NACK_LEADER_UNREACH);
+    }
+
+    // Relay leader response to client
+    // We forward ACK/NACK exactly as leader produced it.
+    if (rtype != MSG_ACK && rtype != MSG_NACK) {
+        free(rpayload);
+        fprintf(stderr, "forward_submit_to_leader: unexpected response type %u from leader\n", rtype);
+        return send_nack(client_fd, NACK_INTERNAL_ERROR);
+    }
+
+    int rc = msg_send(client_fd, rtype, rpayload, rpayload_len);
+    free(rpayload);
+    return rc;
+}
+
 // Handle MSG_SUBMIT: client asks this node to create+sign+append entry.
 static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload_len)
 {
@@ -127,6 +192,11 @@ static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload
     const char *desc = NULL;
     uint16_t desc_len = 0;
     uint64_t client_nonce = 0;
+
+    // If not leader, forward to leader node
+    if (!node_is_leader(n)) {
+        return forward_submit_to_leader(n, fd, payload, payload_len);
+    }
 
     if (msg_parse_submit_payload(payload, payload_len,
                                 &event_type, &player_id,
@@ -156,6 +226,7 @@ static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload
     if (already == 1) {
         // already processed this nonce for this node
         pthread_mutex_unlock(&n->lock);
+        fprintf(stderr, "handle_submit: duplicate nonce %lu from client\n", (unsigned long)client_nonce);
         return send_ack(fd, existing_hash);
     }
 
@@ -263,9 +334,11 @@ static int handle_entry(Node *n, int fd, const uint8_t *payload, size_t payload_
 
     const uint8_t *pub = peers_get_pubkey(&n->peers, e.author_node_id);
     if (!pub) {
+        fprintf(stderr, "handle_entry: unknown peer author_node_id %u\n", e.author_node_id);
         return send_nack(fd, NACK_UNKNOWN_PEER);
     }
     if (do_verify_with_pub(e.entry_hash, e.signature, pub) != 0) {
+        fprintf(stderr, "handle_entry: bad signature from author_node_id %u\n", e.author_node_id);
         return send_nack(fd, NACK_BAD_SIGNATURE);
     }
 
@@ -317,8 +390,25 @@ static int handle_entry(Node *n, int fd, const uint8_t *payload, size_t payload_
 
     // In v1, you can either ACK or just ignore.
     // ACK is useful for debugging.
-    return send_ack(fd, e.entry_hash);
+    //return send_ack(fd, e.entry_hash);
+    return 0;
 }
+
+static int handle_pubkey_req(Node *n, int fd)
+{
+    // Ensure keys loaded (should already be in node_create, but safe)
+    if (load_or_create_keys(n->cfg.pub_path, n->cfg.priv_path) != 0) {
+        fprintf(stderr, "handle_pubkey_req: failed to load or create keys\n");
+        return send_nack(fd, NACK_INTERNAL_ERROR);
+    }
+
+    uint8_t payload[4 + crypto_sign_PUBLICKEYBYTES];
+    write_u32_le(payload, n->cfg.node_id);
+    memcpy(payload + 4, get_public_key(), crypto_sign_PUBLICKEYBYTES);
+
+    return msg_send(fd, MSG_PUBKEY_RESP, payload, sizeof(payload));
+}
+
 
 // ---------- Connection thread ----------
 
@@ -359,12 +449,18 @@ static void *conn_thread_main(void *arg)
             case MSG_ENTRY:
                 (void)handle_entry(n, fd, payload, payload_len);
                 break;
+            case MSG_PUBKEY_REQ:
+                (void)handle_pubkey_req(n, fd);
+                break;
             default:
                 (void)send_nack(fd, NACK_BAD_FORMAT);
                 break;
         }
 
         free(payload);
+
+        // We expect exactly one request per connection in v1:
+        break;
     }
 
     net_close(&fd);

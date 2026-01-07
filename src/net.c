@@ -159,11 +159,20 @@ int net_recv_exact(int fd, uint8_t *buf, size_t len)
             continue;
         }
         if (n == 0) {
-            // Clean EOF (peer closed) before we got everything
-            fprintf(stderr, "net_recv_exact: peer closed connection before we received all data\n");
-            return 1;
+            // peer closed
+            if (got == 0) {
+                // clean EOF before reading anything
+                return 1;
+            }
+            // EOF mid-frame => truncated protocol data
+            fprintf(stderr,
+                    "net_recv_exact: peer closed connection mid-frame (wanted %zu more bytes)\n",
+                    n - got);
+            return -1;
         }
-        if (errno == EINTR) continue;
+        if (errno == EINTR) {
+            continue;
+        }
         fprintf(stderr, "net_recv_exact: recv failed: %s\n", strerror(errno));
         return -1;
     }

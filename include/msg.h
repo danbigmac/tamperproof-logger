@@ -33,6 +33,8 @@ typedef enum {
     MSG_ACK      = 3,
     MSG_NACK     = 4,
     MSG_STATUS   = 5,  // optional for v1
+    MSG_PUBKEY_REQ  = 6,
+    MSG_PUBKEY_RESP = 7,
 } MsgType;
 
 // Receive result codes (so you can distinguish disconnect vs error)
@@ -49,7 +51,9 @@ typedef enum {
     NACK_DOES_NOT_EXTEND_CHAIN = 3,
     NACK_DUPLICATE = 4,
     NACK_INTERNAL_ERROR = 5,
-    NACK_UNKNOWN_PEER = 6
+    NACK_UNKNOWN_PEER = 6,
+    NACK_NOT_LEADER       = 7,
+    NACK_LEADER_UNREACH   = 8
 } NackReason;
 
 // Sends a frame: [u32_le frame_len][type][version][payload...]

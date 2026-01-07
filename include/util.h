@@ -23,6 +23,8 @@ int has_flag(int argc, char **argv, const char *flag);
 
 void util_print_hex(const uint8_t *data, size_t len);
 
+void util_print_hex_compact(const uint8_t *data, size_t len);
+
 int decode_pubkey_hex(uint8_t *out, size_t out_max,
                       const char *in, size_t in_len);
 
