@@ -12,6 +12,7 @@ void test_entry_roundtrip(void)
         123456789,
         42 /*author*/,
         12345ULL /*nonce*/,
+        1,  // log_index
         1,
         23,
         "hello world",

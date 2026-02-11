@@ -229,3 +229,65 @@ int msg_parse_submit_payload(const uint8_t *payload, size_t payload_len,
     *client_nonce_out = nonce;
     return 0;
 }
+
+int msg_build_repl_ack_payload(uint8_t **payload_out, size_t *payload_len_out,
+                               uint8_t ok,
+                               uint64_t log_index,
+                               const uint8_t entry_hash[HASH_SIZE],
+                               uint8_t reason)
+{
+    if (!payload_out || !payload_len_out || !entry_hash) {
+        return -1;
+    }
+
+    size_t total = ok ? REPL_ACK_OK_SIZE : REPL_ACK_FAIL_SIZE;
+    uint8_t *p = (uint8_t *)malloc(total);
+    if (!p) {
+        return -1;
+    }
+
+    p[0] = ok ? 1 : 0;
+    write_u64_le(p + 1, log_index);
+    memcpy(p + 1 + 8, entry_hash, HASH_SIZE);
+
+    if (!ok) {
+        p[1 + 8 + HASH_SIZE] = reason;
+    }
+
+    *payload_out = p;
+    *payload_len_out = total;
+    return 0;
+}
+
+int msg_parse_repl_ack_payload(const uint8_t *payload, size_t payload_len,
+                               uint8_t *ok_out,
+                               uint64_t *log_index_out,
+                               uint8_t entry_hash_out[HASH_SIZE],
+                               uint8_t *reason_out)
+{
+    if (!payload || !ok_out || !log_index_out || !entry_hash_out || !reason_out) {
+        return -1;
+    }
+
+    if (payload_len != REPL_ACK_OK_SIZE && payload_len != REPL_ACK_FAIL_SIZE) {
+        return -1;
+    }
+
+    uint8_t ok = payload[0];
+    if (ok != 0 && ok != 1) {
+        return -1;
+    }
+    if (ok == 1 && payload_len != REPL_ACK_OK_SIZE) {
+        return -1;
+    }
+    if (ok == 0 && payload_len != REPL_ACK_FAIL_SIZE) {
+        return -1;
+    }
+
+    *ok_out = ok;
+    *log_index_out = read_u64_le(payload + 1);
+    memcpy(entry_hash_out, payload + 1 + 8, HASH_SIZE);
+    *reason_out = ok ? 0 : payload[1 + 8 + HASH_SIZE];
+
+    return 0;
+}

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int fileio_append_entry(const char *path, const LogEntry *entry)
 {
@@ -200,4 +201,106 @@ int fileio_read_last(const char *path, LogEntry *entry_out)
 
     free(buf);
     return r;
+}
+
+int fileio_get_tip(const char *path,
+                   uint64_t *last_index_out,
+                   uint8_t last_hash_out[HASH_SIZE])
+{
+    if (!path || !last_index_out || !last_hash_out) {
+        return -1;
+    }
+
+    LogEntry last;
+    if (fileio_read_last(path, &last) == 0) {
+        *last_index_out = last.log_index;
+        memcpy(last_hash_out, last.entry_hash, HASH_SIZE);
+        return 0;
+    }
+
+    *last_index_out = 0;
+    memset(last_hash_out, 0, HASH_SIZE);
+    return 0;
+}
+
+int fileio_truncate_after(const char *path, uint64_t keep_log_index)
+{
+    if (!path) {
+        return -1;
+    }
+
+    if (keep_log_index == 0) {
+        FILE *f = fopen(path, "wb");
+        if (!f) return -1;
+        fclose(f);
+        return 0;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+
+    long keep_end = -1;
+    long offset = 0;
+
+    while (1) {
+        uint8_t prefix_buf[ENTRY_LENGTH_PREFIX_SIZE];
+        size_t n = fread(prefix_buf, 1, ENTRY_LENGTH_PREFIX_SIZE, f);
+
+        if (n == 0) {
+            break;
+        }
+        if (n != ENTRY_LENGTH_PREFIX_SIZE) {
+            fclose(f);
+            return -1;
+        }
+
+        uint32_t body_size = read_u32_le(prefix_buf);
+        if (body_size > (1u << 20)) {
+            fclose(f);
+            return -1;
+        }
+
+        size_t total_size = ENTRY_LENGTH_PREFIX_SIZE + body_size + FOOTER_SIZE;
+        uint8_t *buf = (uint8_t *)malloc(total_size);
+        if (!buf) {
+            fclose(f);
+            return -1;
+        }
+
+        memcpy(buf, prefix_buf, ENTRY_LENGTH_PREFIX_SIZE);
+        if (fread(buf + ENTRY_LENGTH_PREFIX_SIZE, 1, body_size + FOOTER_SIZE, f) !=
+            body_size + FOOTER_SIZE) {
+            free(buf);
+            fclose(f);
+            return -1;
+        }
+
+        LogEntry e;
+        if (entry_deserialize(&e, buf, total_size) != 0) {
+            free(buf);
+            fclose(f);
+            return -1;
+        }
+        free(buf);
+
+        offset += (long)total_size;
+        if (e.log_index == keep_log_index) {
+            keep_end = offset;
+            break;
+        }
+    }
+
+    fclose(f);
+
+    if (keep_end < 0) {
+        return -1;
+    }
+
+    if (truncate(path, keep_end) != 0) {
+        return -1;
+    }
+
+    return 0;
 }

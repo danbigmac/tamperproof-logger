@@ -4,6 +4,7 @@
 #include "event_type.h"
 #include "crypto.h"
 #include "util.h"
+#include "peers.h"
 #include <sodium.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,12 +33,12 @@ int logger_add(const char *log_path,
                uint32_t player_id,
                const char *description)
 {
-    LogEntry prev = {0};
     uint8_t prev_hash[HASH_SIZE] = {0};
+    uint64_t last_index = 0;
 
-    // Load last entry if exists
-    if (fileio_read_last(log_path, &prev) == 0) {
-        memcpy(prev_hash, prev.entry_hash, HASH_SIZE);
+    if (fileio_get_tip(log_path, &last_index, prev_hash) != 0) {
+        fprintf(stderr, "logger_add: failed to read log tip\n");
+        return -1;
     }
 
     // Create a new entry
@@ -45,6 +46,7 @@ int logger_add(const char *log_path,
         util_timestamp_now(),
         author_node_id,
         nonce,
+        last_index + 1,
         event_type,
         player_id,
         description,
@@ -61,19 +63,32 @@ int logger_add(const char *log_path,
     return fileio_append_entry(log_path, &entry);
 }
 
-// logger.c
-#include "logger.h"
-#include "fileio.h"
-#include "entry.h"
-#include "event_type.h"
-#include "crypto.h"
-#include "util.h"
-#include "peers.h"
+/** Entry policy function type */
+typedef int (*entry_policy_fn)(void *ctx, const LogEntry *e, size_t idx);
+/** Leader policy context */
+typedef struct {
+    uint32_t leader_id;
+} LeaderPolicyCtx;
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+/* return 0 ok, nonzero -> fail */
+static int policy_none(void *ctx, const LogEntry *e, size_t idx)
+{
+    (void)ctx; (void)e; (void)idx;
+    return 0;
+}
 
+static int policy_require_leader_author(void *ctx, const LogEntry *e, size_t idx)
+{
+    LeaderPolicyCtx *lp = (LeaderPolicyCtx *)ctx;
+    if (e->author_node_id != lp->leader_id) {
+        fprintf(stderr, "verify: entry %zu author=%u != leader=%u\n",
+                idx, e->author_node_id, lp->leader_id);
+        return -1;
+    }
+    return 0;
+}
+
+/** Public key resolver function type */
 typedef const uint8_t *(*pubkey_resolver_fn)(void *ctx, uint32_t author_node_id);
 
 /* -------------------------
@@ -96,10 +111,11 @@ static const uint8_t *resolve_pub_from_peers(void *ctx, uint32_t author_node_id)
 /* -------------------------
  * Shared verification core
  * ------------------------- */
-
 static int verify_entries_with_resolver(const char *log_path,
                                        pubkey_resolver_fn resolve_pub,
-                                       void *resolve_ctx)
+                                       void *resolve_ctx,
+                                       entry_policy_fn policy,
+                                       void *policy_ctx)
 {
     size_t count = 0;
     LogEntry *entries = fileio_read_all(log_path, &count);
@@ -109,6 +125,12 @@ static int verify_entries_with_resolver(const char *log_path,
     }
 
     for (size_t i = 0; i < count; i++) {
+        // Apply entry policy if set
+        if (policy && policy(policy_ctx, &entries[i], i) != 0) {
+            fprintf(stderr, "verify: entry %zu failed policy check\n", i);
+            free(entries);
+            return -1;
+        }
 
         // 1) Verify hash correctness: recompute hash(entry_body)
         uint8_t expected_hash[HASH_SIZE];
@@ -182,20 +204,77 @@ static int verify_entries_with_resolver(const char *log_path,
 
 int logger_verify(const char *log_path)
 {
-    // Single-key verify uses the resolver that returns get_public_key().
-    // If you still rely on key-rotation entries to update PUBLIC_KEY,
-    // you can keep your old key rotation logic here by doing:
-    //
-    //   - read all entries
-    //   - for each entry:
-    //       verify using current PUBLIC_KEY
-    //       if KEY_ROTATION: set_public_key(...)
-    //
-    // But that approach conflicts with multi-author verification and
-    // isn't great long-term. For now, simplest is to verify using the
-    // current root public key only:
+    size_t count = 0;
+    LogEntry *entries = fileio_read_all(log_path, &count);
+    if (!entries) {
+        fprintf(stderr, "verify: no entries or failed to read log (corruption/truncation?)\n");
+        return -1;
+    }
 
-    return verify_entries_with_resolver(log_path, resolve_pub_single, NULL);
+    uint8_t current_pub[crypto_sign_PUBLICKEYBYTES];
+    memcpy(current_pub, get_public_key(), sizeof(current_pub));
+
+    for (size_t i = 0; i < count; i++) {
+        uint8_t expected_hash[HASH_SIZE];
+        if (entry_compute_hash(&entries[i], expected_hash) != 0) {
+            fprintf(stderr, "verify: failed to compute hash at entry %zu\n", i);
+            free(entries);
+            return -1;
+        }
+        if (memcmp(entries[i].entry_hash, expected_hash, HASH_SIZE) != 0) {
+            fprintf(stderr, "verify: entry %zu hash mismatch (tampered entry data)\n", i);
+            free(entries);
+            return -1;
+        }
+
+        if (i == 0) {
+            uint8_t zeros[HASH_SIZE] = {0};
+            if (memcmp(entries[i].prev_hash, zeros, HASH_SIZE) != 0) {
+                fprintf(stderr, "verify: genesis entry has non-zero prev_hash\n");
+                free(entries);
+                return -1;
+            }
+        } else {
+            if (memcmp(entries[i].prev_hash, entries[i - 1].entry_hash, HASH_SIZE) != 0) {
+                fprintf(stderr, "verify: entry %zu chain broken (prev_hash mismatch)\n", i);
+                free(entries);
+                return -1;
+            }
+        }
+
+        if (do_verify_with_pub(entries[i].entry_hash, entries[i].signature, current_pub) != 0) {
+            fprintf(stderr, "verify: signature invalid at entry %zu (author=%u)\n",
+                    i, entries[i].author_node_id);
+            free(entries);
+            return -1;
+        }
+
+        if (entries[i].event_type == EVENT_KEY_ROTATION) {
+            uint8_t next_pub[crypto_sign_PUBLICKEYBYTES];
+            int decoded = decode_pubkey_hex(next_pub,
+                                            sizeof(next_pub),
+                                            entries[i].description,
+                                            entries[i].description_len);
+            if (decoded != crypto_sign_PUBLICKEYBYTES) {
+                fprintf(stderr, "verify: invalid KEY_ROTATION pubkey encoding at entry %zu\n", i);
+                free(entries);
+                return -1;
+            }
+            memcpy(current_pub, next_pub, sizeof(current_pub));
+        }
+    }
+
+    free(entries);
+    printf("Log verified: all entries valid.\n");
+    return 0;
+}
+
+int logger_verify_local(const char *log_path, uint32_t leader_id)
+{
+    LeaderPolicyCtx p = { .leader_id = leader_id };
+    return verify_entries_with_resolver(log_path,
+                                        resolve_pub_single, NULL,
+                                        policy_require_leader_author, &p);
 }
 
 int logger_verify_peers(const char *log_path, const char *peers_conf_path)
@@ -214,7 +293,7 @@ int logger_verify_peers(const char *log_path, const char *peers_conf_path)
         return -1;
     }
 
-    int rc = verify_entries_with_resolver(log_path, resolve_pub_from_peers, &ps);
+    int rc = verify_entries_with_resolver(log_path, resolve_pub_from_peers, &ps, policy_none, NULL);
 
     peers_free(&ps);
     return rc;
@@ -340,20 +419,20 @@ int logger_rotate_keys(const char *log_path,
         return -1;
     }
 
-    // Get prev_hash from last entry (or zeros if none)
+    // Get prev_hash/index from last entry (or zeros/0 if none)
     uint8_t prev_hash[HASH_SIZE] = {0};
-    LogEntry last;
-    if (fileio_read_last(log_path, &last) != 0) {
-        fprintf(stderr, "logger_rotate_keys: failed to read last log entry\n");
+    uint64_t last_index = 0;
+    if (fileio_get_tip(log_path, &last_index, prev_hash) != 0) {
+        fprintf(stderr, "logger_rotate_keys: failed to read log tip\n");
         return -1;
     }
-    memcpy(prev_hash, last.entry_hash, HASH_SIZE);
 
     // Create KEY_ROTATION log entry
     LogEntry entry = entry_create(
         util_timestamp_now(),
         author_node_id,
         nonce,
+        last_index + 1,
         EVENT_KEY_ROTATION,
         0,          // player_id not meaningful here
         desc,

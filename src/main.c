@@ -17,7 +17,8 @@ static void print_usage(void)
 {
     printf("Usage:\n");
     printf("  logger add <event_type> <player_id> <description> [--author N] [--nonce N] [--log PATH] [--pub PATH] [--priv PATH]\n");
-    printf("  logger verify [logfile] [--log PATH] [--pub PATH] [--priv PATH]\n");
+    printf("  logger verify-local --leader-id N [--log PATH] [--pub PATH] [--priv PATH]\n");
+    printf("  logger verify-peers --peers PATH [--log PATH]\n");
     printf("  logger rotate_keys [--author N] [--nonce N] [--log PATH] [--pub PATH] [--priv PATH]\n");
     printf("  logger print [logfile] [--log PATH]\n");
     printf("\nNotes:\n");
@@ -295,6 +296,47 @@ int main(int argc, char **argv)
             return 0;
         } else {
             printf("Log verification FAILED.\n");
+            return 1;
+        }
+    }
+
+    //
+    // -------------------------------
+    // Command: VERIFY LOCAL
+    // -------------------------------
+    //
+    else if (strcmp(cmd, "verify-local") == 0) {
+
+        if (load_or_create_keys(pub_path, priv_path) != 0) {
+            fprintf(stderr, "Could not load or create keypair\n");
+            return 1;
+        }
+
+        // const char *pos_logfile = get_flag_value(argc, argv, "--log");
+        // if (pos_logfile && pos_logfile[0] != '-') { // optional positional, but avoid eating flags
+        //     log_path = pos_logfile;
+        // }
+
+        const char *leader_s = get_flag_value(argc, argv, "--leader-id");
+        if (!leader_s) {
+            fprintf(stderr, "verify-local requires --leader-id\n");
+            print_usage();
+            return 1;
+        }
+
+        uint32_t leader_id = 0;
+        if (parse_u32(leader_s, &leader_id) != 0) {
+            fprintf(stderr, "invalid --leader-id\n");
+            return 1;
+        }
+
+        int rc = logger_verify_local(log_path, leader_id);
+        if (rc == 0) {
+            printf("Log verified (local/leader): OK.\n");
+            return 0;
+        }
+        else {
+            printf("Log verification (local/leader) FAILED.\n");
             return 1;
         }
     }

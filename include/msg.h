@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "entry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,9 @@ extern "C" {
 #define MSG_PLAYER_ID_SIZE 4
 #define MSG_DESCRIPTION_LEN_SIZE 2
 
+#define REPL_ACK_OK_SIZE   (1 + 8 + HASH_SIZE)        // 41
+#define REPL_ACK_FAIL_SIZE (1 + 8 + HASH_SIZE + 1)    // 42
+
 typedef enum {
     MSG_SUBMIT   = 1,
     MSG_ENTRY    = 2,
@@ -35,6 +39,8 @@ typedef enum {
     MSG_STATUS   = 5,  // optional for v1
     MSG_PUBKEY_REQ  = 6,
     MSG_PUBKEY_RESP = 7,
+    MSG_REPL_ENTRY = 8,
+    MSG_REPL_ACK   = 9,
 } MsgType;
 
 // Receive result codes (so you can distinguish disconnect vs error)
@@ -53,8 +59,19 @@ typedef enum {
     NACK_INTERNAL_ERROR = 5,
     NACK_UNKNOWN_PEER = 6,
     NACK_NOT_LEADER       = 7,
-    NACK_LEADER_UNREACH   = 8
+    NACK_LEADER_UNREACH   = 8,
+    NACK_QUORUM_NOT_REACHED = 9
 } NackReason;
+
+typedef enum {
+    REPL_NACK_BAD_FORMAT = 1,
+    REPL_NACK_BAD_SIGNATURE = 2,
+    REPL_NACK_DOES_NOT_EXTEND_CHAIN = 3,
+    REPL_NACK_DUPLICATE = 4,
+    REPL_NACK_INTERNAL_ERROR = 5,
+    REPL_NACK_UNKNOWN_PEER = 6,
+    REPL_NACK_INDEX_MISMATCH = 7
+} ReplNackReason;
 
 // Sends a frame: [u32_le frame_len][type][version][payload...]
 int msg_send(int fd, uint8_t type,
@@ -92,6 +109,21 @@ int msg_parse_submit_payload(const uint8_t *payload, size_t payload_len,
                              uint32_t *event_type_out, uint32_t *player_id_out,
                              const char **desc_out, uint16_t *desc_len_out,
                              uint64_t *client_nonce_out);
+
+// ---- MSG_REPL_ACK payload helpers ----
+// Success payload: [u8 ok=1][u64_le log_index][u8 hash[32]]
+// Failure payload: [u8 ok=0][u64_le expected_or_failed_index][u8 hash[32]][u8 reason]
+int msg_build_repl_ack_payload(uint8_t **payload_out, size_t *payload_len_out,
+                               uint8_t ok,
+                               uint64_t log_index,
+                               const uint8_t entry_hash[HASH_SIZE],
+                               uint8_t reason);
+
+int msg_parse_repl_ack_payload(const uint8_t *payload, size_t payload_len,
+                               uint8_t *ok_out,
+                               uint64_t *log_index_out,
+                               uint8_t entry_hash_out[HASH_SIZE],
+                               uint8_t *reason_out);
 
 #ifdef __cplusplus
 }

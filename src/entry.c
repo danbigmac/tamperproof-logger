@@ -8,6 +8,7 @@
 LogEntry entry_create(uint64_t timestamp,
                       uint32_t author_node_id,
                       uint64_t nonce,
+                      uint64_t log_index,
                       uint32_t event_type,
                       uint32_t player_id,
                       const char *description,
@@ -17,6 +18,7 @@ LogEntry entry_create(uint64_t timestamp,
     e.timestamp = timestamp;
     e.author_node_id = author_node_id;
     e.nonce = nonce;
+    e.log_index = log_index;
     e.event_type = event_type;
     e.player_id = player_id;
     size_t dlen = strlen(description);
@@ -47,6 +49,8 @@ size_t entry_serialize_for_hash(const LogEntry *e, uint8_t *buf, size_t max)
     p += AUTHOR_NODE_ID_SIZE;
     write_u64_le(p, e->nonce);
     p += NONCE_SIZE;
+    write_u64_le(p, e->log_index);
+    p += LOG_INDEX_SIZE;
     write_u32_le(p, e->event_type);
     p += EVENT_TYPE_SIZE;
     write_u32_le(p, e->player_id);
@@ -123,6 +127,8 @@ int entry_deserialize(LogEntry *e, const uint8_t *buf, size_t total_size)
     p += AUTHOR_NODE_ID_SIZE;
     e->nonce = read_u64_le(p);
     p += NONCE_SIZE;
+    e->log_index = read_u64_le(p);
+    p += LOG_INDEX_SIZE;
     e->event_type = read_u32_le(p);
     p += EVENT_TYPE_SIZE;
     e->player_id = read_u32_le(p);
@@ -177,6 +183,8 @@ size_t entry_serialize(const LogEntry *e, uint8_t *buf, size_t max)
     p += AUTHOR_NODE_ID_SIZE;
     write_u64_le(p, e->nonce);
     p += NONCE_SIZE;
+    write_u64_le(p, e->log_index);
+    p += LOG_INDEX_SIZE;
     write_u32_le(p, e->event_type);
     p += EVENT_TYPE_SIZE;
     write_u32_le(p, e->player_id);

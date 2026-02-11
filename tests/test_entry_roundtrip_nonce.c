@@ -15,6 +15,7 @@ int main(void)
         123456789ULL,
         42,                 // author_node_id
         999999ULL,          // nonce
+        1,                  // log_index
         2,                  // event_type
         23,                 // player_id
         "hello",

@@ -1,12 +1,10 @@
 #include "node.h"
 #include "net.h"
 #include "msg.h"
-#include "logger.h"
 #include "fileio.h"
 #include "entry.h"
 #include "crypto.h"
 #include "util.h"
-#include "event_type.h"
 #include "peers.h"
 #include "idem.h"
 
@@ -14,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
     Node *node;
@@ -25,14 +24,31 @@ struct Node {
 
     int listen_fd;
     pthread_mutex_t lock;
+    int lock_inited;
 
     uint8_t last_hash[HASH_SIZE];
     int has_last_hash;
 
+    uint64_t last_index;
+    int has_last_index;
+
     PeerSet peers;
 
     IdemTable idem_table;
+
+    pthread_mutex_t fanout_lock;
+    int fanout_lock_inited;
+    pthread_cond_t fanout_cv;
+    int fanout_cv_inited;
+    pthread_t fanout_tid;
+    int fanout_thread_started;
+    int fanout_stop;
+    int fanout_pending;
+    uint64_t fanout_target_index;
+    uint8_t fanout_target_hash[HASH_SIZE];
 };
+
+static void *fanout_thread_main(void *arg);
 
 static int node_seed_idempotency_from_log(Node *n, size_t max_entries_to_load)
 {
@@ -44,27 +60,123 @@ static int node_seed_idempotency_from_log(Node *n, size_t max_entries_to_load)
     size_t count = 0;
     LogEntry *entries = fileio_read_all(n->cfg.log_path, &count);
     if (!entries) {
-        // no log yet is not an error
-        fprintf(stderr, "node_seed_idempotency_from_log: no log entries found\n");
+        // Empty log is fine.
+        n->last_index = 0;
+        n->has_last_index = 0;
+        n->has_last_hash = 0;
         return 0;
     }
 
-    // If max_entries_to_load is nonzero, only load the last N entries
     size_t start = 0;
     if (max_entries_to_load > 0 && count > max_entries_to_load) {
         start = count - max_entries_to_load;
     }
 
-    // Rebuild idem table from entries[start..count)
-    // (If duplicates exist in log, the latest mapping wins, which is fine.)
     for (size_t i = start; i < count; i++) {
-        idem_put(&n->idem_table,
-                 entries[i].author_node_id,
-                 entries[i].nonce,
-                 entries[i].entry_hash);
+        (void)idem_put(&n->idem_table,
+                       entries[i].author_node_id,
+                       entries[i].nonce,
+                       entries[i].entry_hash);
     }
 
-    // Seed last_hash from the actual last entry
+    memcpy(n->last_hash, entries[count - 1].entry_hash, HASH_SIZE);
+    n->has_last_hash = 1;
+    n->last_index = entries[count - 1].log_index;
+    n->has_last_index = 1;
+
+    free(entries);
+    return 0;
+}
+
+static int node_is_leader(Node *n)
+{
+    if (!n) return 0;
+    return (n->cfg.node_id == n->cfg.leader_id);
+}
+
+// Must be called with n->lock held.
+static int node_ensure_tip_locked(Node *n)
+{
+    if (!n) return -1;
+
+    if (n->has_last_hash && n->has_last_index) {
+        return 0;
+    }
+
+    uint64_t last_index = 0;
+    uint8_t last_hash[HASH_SIZE] = {0};
+    if (fileio_get_tip(n->cfg.log_path, &last_index, last_hash) != 0) {
+        return -1;
+    }
+
+    if (last_index == 0) {
+        n->last_index = 0;
+        n->has_last_index = 0;
+        n->has_last_hash = 0;
+        memset(n->last_hash, 0, HASH_SIZE);
+        return 0;
+    }
+
+    n->last_index = last_index;
+    n->has_last_index = 1;
+    memcpy(n->last_hash, last_hash, HASH_SIZE);
+    n->has_last_hash = 1;
+    return 0;
+}
+
+// Must be called with n->lock held.
+static int node_get_tip_locked(Node *n,
+                               uint8_t prev_hash_out[HASH_SIZE],
+                               uint64_t *next_index_out)
+{
+    if (!n || !prev_hash_out || !next_index_out) {
+        return -1;
+    }
+
+    if (node_ensure_tip_locked(n) != 0) {
+        return -1;
+    }
+
+    if (n->has_last_hash) {
+        memcpy(prev_hash_out, n->last_hash, HASH_SIZE);
+    } else {
+        memset(prev_hash_out, 0, HASH_SIZE);
+    }
+
+    *next_index_out = (n->has_last_index ? n->last_index : 0) + 1;
+    return 0;
+}
+
+// Must be called with n->lock held.
+static int node_reload_state_from_disk_locked(Node *n)
+{
+    if (!n) {
+        return -1;
+    }
+
+    idem_clear(&n->idem_table);
+
+    n->last_index = 0;
+    n->has_last_index = 0;
+    n->has_last_hash = 0;
+    memset(n->last_hash, 0, HASH_SIZE);
+
+    size_t count = 0;
+    LogEntry *entries = fileio_read_all(n->cfg.log_path, &count);
+    if (!entries || count == 0) {
+        free(entries);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        (void)idem_put(&n->idem_table,
+                       entries[i].author_node_id,
+                       entries[i].nonce,
+                       entries[i].entry_hash);
+    }
+
+    n->last_index = entries[count - 1].log_index;
+    n->has_last_index = 1;
     memcpy(n->last_hash, entries[count - 1].entry_hash, HASH_SIZE);
     n->has_last_hash = 1;
 
@@ -72,51 +184,100 @@ static int node_seed_idempotency_from_log(Node *n, size_t max_entries_to_load)
     return 0;
 }
 
-// Return 1 if node is leader, 0 otherwise.
-static int node_is_leader(Node *n) {
-    if (!n) {
-        fprintf(stderr, "node_is_leader: null node pointer... so returning 0\n");
-        return 0;
-    }
-    return (n->cfg.node_id == n->cfg.leader_id);
-}
-
-// Best-effort broadcast of a serialized entry to peers.
-// Called AFTER the entry is appended locally.
-static void broadcast_entry(Node *n, const uint8_t *entry_bytes, size_t entry_len)
+// Must be called with n->lock held.
+static int node_lookup_entry_by_index_locked(Node *n,
+                                             uint64_t log_index,
+                                             LogEntry *entry_out)
 {
-    uint8_t *payload = NULL;
-    size_t payload_len = 0;
-
-    if (msg_build_entry_payload(&payload, &payload_len, entry_bytes, entry_len) != 0) {
-        return;
+    if (!n || !entry_out) {
+        return -1;
     }
 
-    for (size_t i = 0; i < n->peers.count; i++) {
-        const Peer *p = &n->peers.items[i];
-        if (p->node_id == n->cfg.node_id) {
-            continue;
+    size_t count = 0;
+    LogEntry *entries = fileio_read_all(n->cfg.log_path, &count);
+    if (!entries || count == 0) {
+        free(entries);
+        return -1;
+    }
+
+    int rc = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].log_index == log_index) {
+            *entry_out = entries[i];
+            rc = 0;
+            break;
         }
-        int fd = net_connect_tcp(p->host, p->port);
-        if (fd < 0) continue;
-
-        // optional: timeouts so peers can’t stall you
-        // dont really care about return value here
-        net_set_timeouts(fd, 1000, 1000);
-
-        msg_send(fd, MSG_ENTRY, payload, payload_len);
-        net_close(&fd);
     }
 
-    free(payload);
+    free(entries);
+    return rc;
 }
 
-// ---------- Handlers ----------
+static int node_snapshot_log(Node *n, LogEntry **entries_out, size_t *count_out)
+{
+    if (!n || !entries_out || !count_out) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&n->lock);
+    LogEntry *entries = fileio_read_all(n->cfg.log_path, count_out);
+    pthread_mutex_unlock(&n->lock);
+
+    if (!entries || *count_out == 0) {
+        free(entries);
+        *count_out = 0;
+        return -1;
+    }
+
+    *entries_out = entries;
+    return 0;
+}
+
+static const LogEntry *find_entry_by_index(const LogEntry *entries,
+                                           size_t count,
+                                           uint64_t log_index)
+{
+    if (!entries) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].log_index == log_index) {
+            return &entries[i];
+        }
+    }
+    return NULL;
+}
+
+static int node_find_entry_by_author_nonce(Node *n,
+                                           uint32_t author_node_id,
+                                           uint64_t nonce,
+                                           LogEntry *entry_out)
+{
+    if (!n || !entry_out) {
+        return -1;
+    }
+
+    LogEntry *entries = NULL;
+    size_t count = 0;
+    if (node_snapshot_log(n, &entries, &count) != 0) {
+        return -1;
+    }
+
+    int found = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].author_node_id == author_node_id && entries[i].nonce == nonce) {
+            *entry_out = entries[i];
+            found = 0;
+            break;
+        }
+    }
+
+    free(entries);
+    return found;
+}
 
 static int send_ack(int fd, const uint8_t entry_hash[HASH_SIZE])
 {
     uint8_t payload[1 + HASH_SIZE];
-    payload[0] = 1; // ok
+    payload[0] = 1;
     memcpy(payload + 1, entry_hash, HASH_SIZE);
     return msg_send(fd, MSG_ACK, payload, sizeof(payload));
 }
@@ -124,23 +285,428 @@ static int send_ack(int fd, const uint8_t entry_hash[HASH_SIZE])
 static int send_nack(int fd, uint8_t reason)
 {
     uint8_t payload[2];
-    payload[0] = 0; // ok=0
+    payload[0] = 0;
     payload[1] = reason;
     return msg_send(fd, MSG_NACK, payload, sizeof(payload));
+}
+
+static int send_repl_ack(int fd,
+                         uint8_t ok,
+                         uint64_t log_index,
+                         const uint8_t entry_hash[HASH_SIZE],
+                         uint8_t reason)
+{
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+
+    if (msg_build_repl_ack_payload(&payload, &payload_len,
+                                   ok, log_index, entry_hash, reason) != 0) {
+        return -1;
+    }
+
+    int rc = msg_send(fd, MSG_REPL_ACK, payload, payload_len);
+    free(payload);
+    return rc;
+}
+
+static int send_repl_entry_and_wait_ack(int fd,
+                                        const LogEntry *entry,
+                                        uint8_t *ok_out,
+                                        uint64_t *log_index_out,
+                                        uint8_t hash_out[HASH_SIZE],
+                                        uint8_t *reason_out)
+{
+    uint8_t entry_bytes[2048];
+    size_t entry_len = entry_serialize(entry, entry_bytes, sizeof(entry_bytes));
+    if (entry_len == 0) {
+        return -1;
+    }
+
+    uint8_t *payload = NULL;
+    size_t payload_len = 0;
+    if (msg_build_entry_payload(&payload, &payload_len, entry_bytes, entry_len) != 0) {
+        return -1;
+    }
+
+    if (msg_send(fd, MSG_REPL_ENTRY, payload, payload_len) != 0) {
+        free(payload);
+        return -1;
+    }
+    free(payload);
+
+    uint8_t type = 0, ver = 0;
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+
+    MsgResult r = msg_recv(fd, &type, &ver, &resp, &resp_len);
+    if (r != MSG_OK || ver != MSG_VERSION || type != MSG_REPL_ACK) {
+        free(resp);
+        return -1;
+    }
+
+    int rc = msg_parse_repl_ack_payload(resp, resp_len,
+                                        ok_out, log_index_out, hash_out, reason_out);
+    free(resp);
+    return rc;
+}
+
+static int replicate_one_peer_once(const Peer *p,
+                                   const LogEntry *entries,
+                                   size_t count,
+                                   uint64_t target_index,
+                                   const uint8_t target_hash[HASH_SIZE])
+{
+    if (!p || !entries || count == 0 || !target_hash) {
+        return -1;
+    }
+
+    const LogEntry *target_entry = find_entry_by_index(entries, count, target_index);
+    if (!target_entry) {
+        return -1;
+    }
+    if (memcmp(target_entry->entry_hash, target_hash, HASH_SIZE) != 0) {
+        return -1;
+    }
+
+    int fd = net_connect_tcp(p->host, p->port);
+    if (fd < 0) {
+        return -1;
+    }
+
+    (void)net_set_timeouts(fd, 1000, 1000);
+
+    uint64_t next_to_send = target_index;
+    size_t safety = 0;
+    size_t safety_limit = (count * 4) + 16;
+    if (safety_limit < 32) {
+        safety_limit = 32;
+    }
+
+    while (safety++ < safety_limit) {
+        const LogEntry *e = find_entry_by_index(entries, count, next_to_send);
+        if (!e) {
+            net_close(&fd);
+            return -1;
+        }
+
+        uint8_t ok = 0;
+        uint64_t ack_index = 0;
+        uint8_t ack_hash[HASH_SIZE] = {0};
+        uint8_t reason = 0;
+
+        if (send_repl_entry_and_wait_ack(fd, e,
+                                         &ok, &ack_index, ack_hash, &reason) != 0) {
+            net_close(&fd);
+            return -1;
+        }
+
+        if (ok == 1) {
+            if (ack_index != e->log_index) {
+                net_close(&fd);
+                return -1;
+            }
+            if (memcmp(ack_hash, e->entry_hash, HASH_SIZE) != 0) {
+                net_close(&fd);
+                return -1;
+            }
+
+            if (ack_index == target_index &&
+                memcmp(ack_hash, target_hash, HASH_SIZE) == 0) {
+                net_close(&fd);
+                return 0;
+            }
+
+            if (next_to_send >= target_index) {
+                net_close(&fd);
+                return -1;
+            }
+
+            next_to_send++;
+            continue;
+        }
+
+        if (reason == REPL_NACK_INDEX_MISMATCH) {
+            if (ack_index == 0) {
+                net_close(&fd);
+                return -1;
+            }
+
+            // Peer ahead: re-send target index so follower can trim divergent tail.
+            if (ack_index > target_index) {
+                next_to_send = target_index;
+                continue;
+            }
+
+            if (ack_index == next_to_send) {
+                net_close(&fd);
+                return -1;
+            }
+
+            // Peer behind: backfill from the index it expects next.
+            next_to_send = ack_index;
+            continue;
+        }
+
+        if (reason == REPL_NACK_DUPLICATE) {
+            if (ack_index != e->log_index) {
+                net_close(&fd);
+                return -1;
+            }
+            if (memcmp(ack_hash, e->entry_hash, HASH_SIZE) != 0) {
+                net_close(&fd);
+                return -1;
+            }
+
+            if (ack_index == target_index) {
+                net_close(&fd);
+                return 0;
+            }
+
+            if (next_to_send >= target_index) {
+                net_close(&fd);
+                return -1;
+            }
+
+            next_to_send++;
+            continue;
+        }
+
+        if (reason == REPL_NACK_DOES_NOT_EXTEND_CHAIN) {
+            // Step back and search for common prefix, then replay forward.
+            if (next_to_send <= 1) {
+                net_close(&fd);
+                return -1;
+            }
+            next_to_send--;
+            continue;
+        }
+
+        net_close(&fd);
+        return -1;
+    }
+
+    net_close(&fd);
+    return -1;
+}
+
+static int replicate_one_peer(const Peer *p,
+                              const LogEntry *entries,
+                              size_t count,
+                              uint64_t target_index,
+                              const uint8_t target_hash[HASH_SIZE])
+{
+    const int max_attempts = 3;
+
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        if (replicate_one_peer_once(p, entries, count, target_index, target_hash) == 0) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int replicate_to_quorum(Node *n,
+                               uint64_t target_index,
+                               const uint8_t target_hash[HASH_SIZE])
+{
+    if (!n || !target_hash) {
+        return -1;
+    }
+
+    size_t total_nodes = n->peers.count;
+    size_t quorum = (total_nodes / 2) + 1;
+    size_t acks = 1; // leader local append
+
+    if (acks >= quorum) {
+        return 0;
+    }
+
+    LogEntry *entries = NULL;
+    size_t count = 0;
+    if (node_snapshot_log(n, &entries, &count) != 0) {
+        return -1;
+    }
+
+    int rc = -1;
+
+    for (size_t i = 0; i < n->peers.count; i++) {
+        const Peer *p = &n->peers.items[i];
+        if (p->node_id == n->cfg.node_id) {
+            continue;
+        }
+
+        if (replicate_one_peer(p, entries, count, target_index, target_hash) == 0) {
+            acks++;
+            if (acks >= quorum) {
+                rc = 0;
+                break;
+            }
+        }
+    }
+
+    free(entries);
+    return rc;
+}
+
+static int replicate_to_all(Node *n,
+                            uint64_t target_index,
+                            const uint8_t target_hash[HASH_SIZE],
+                            size_t *failed_peers_out)
+{
+    if (!n || !target_hash) {
+        return -1;
+    }
+
+    if (failed_peers_out) {
+        *failed_peers_out = 0;
+    }
+
+    LogEntry *entries = NULL;
+    size_t count = 0;
+    if (node_snapshot_log(n, &entries, &count) != 0) {
+        return -1;
+    }
+
+    size_t failed = 0;
+    for (size_t i = 0; i < n->peers.count; i++) {
+        const Peer *p = &n->peers.items[i];
+        if (p->node_id == n->cfg.node_id) {
+            continue;
+        }
+
+        if (replicate_one_peer(p, entries, count, target_index, target_hash) != 0) {
+            failed++;
+        }
+    }
+
+    free(entries);
+
+    if (failed_peers_out) {
+        *failed_peers_out = failed;
+    }
+    return (failed == 0) ? 0 : -1;
+}
+
+static void node_schedule_async_fanout(Node *n,
+                                       uint64_t target_index,
+                                       const uint8_t target_hash[HASH_SIZE])
+{
+    if (!n || !target_hash || !node_is_leader(n)) {
+        return;
+    }
+
+    pthread_mutex_lock(&n->fanout_lock);
+
+    int should_update = 0;
+    if (!n->fanout_pending) {
+        should_update = 1;
+    } else if (target_index > n->fanout_target_index) {
+        should_update = 1;
+    } else if (target_index == n->fanout_target_index &&
+               memcmp(n->fanout_target_hash, target_hash, HASH_SIZE) != 0) {
+        should_update = 1;
+    }
+
+    if (should_update) {
+        n->fanout_pending = 1;
+        n->fanout_target_index = target_index;
+        memcpy(n->fanout_target_hash, target_hash, HASH_SIZE);
+        pthread_cond_signal(&n->fanout_cv);
+    }
+
+    pthread_mutex_unlock(&n->fanout_lock);
+}
+
+static void *fanout_thread_main(void *arg)
+{
+    Node *n = (Node *)arg;
+    if (!n) {
+        return NULL;
+    }
+
+    while (1) {
+        uint64_t target_index = 0;
+        uint8_t target_hash[HASH_SIZE] = {0};
+
+        pthread_mutex_lock(&n->fanout_lock);
+        while (!n->fanout_stop && !n->fanout_pending) {
+            pthread_cond_wait(&n->fanout_cv, &n->fanout_lock);
+        }
+
+        if (n->fanout_stop) {
+            pthread_mutex_unlock(&n->fanout_lock);
+            break;
+        }
+
+        target_index = n->fanout_target_index;
+        memcpy(target_hash, n->fanout_target_hash, HASH_SIZE);
+        n->fanout_pending = 0;
+        pthread_mutex_unlock(&n->fanout_lock);
+
+        useconds_t backoff_us = 200000;
+        while (1) {
+            if (replicate_to_all(n, target_index, target_hash, NULL) == 0) {
+                break;
+            }
+
+            pthread_mutex_lock(&n->fanout_lock);
+            int stop = n->fanout_stop;
+            int superseded = 0;
+            if (n->fanout_pending) {
+                if (n->fanout_target_index > target_index) {
+                    superseded = 1;
+                } else if (n->fanout_target_index == target_index &&
+                           memcmp(n->fanout_target_hash, target_hash, HASH_SIZE) != 0) {
+                    superseded = 1;
+                }
+            }
+            pthread_mutex_unlock(&n->fanout_lock);
+
+            if (stop || superseded) {
+                break;
+            }
+
+            usleep(backoff_us);
+            if (backoff_us < 1000000) {
+                backoff_us *= 2;
+                if (backoff_us > 1000000) {
+                    backoff_us = 1000000;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static int leader_retry_duplicate(Node *n,
+                                  int client_fd,
+                                  uint64_t client_nonce,
+                                  const uint8_t existing_hash[HASH_SIZE])
+{
+    LogEntry existing_entry;
+    if (node_find_entry_by_author_nonce(n, n->cfg.node_id, client_nonce, &existing_entry) != 0) {
+        return send_nack(client_fd, NACK_INTERNAL_ERROR);
+    }
+
+    if (replicate_to_quorum(n, existing_entry.log_index, existing_entry.entry_hash) != 0) {
+        return send_nack(client_fd, NACK_QUORUM_NOT_REACHED);
+    }
+
+    node_schedule_async_fanout(n, existing_entry.log_index, existing_entry.entry_hash);
+    return send_ack(client_fd, existing_hash);
 }
 
 static int forward_submit_to_leader(Node *n, int client_fd,
                                     const uint8_t *payload, size_t payload_len)
 {
-    // Find leader endpoint
     const Peer *leader = peers_get(&n->peers, n->cfg.leader_id);
     if (!leader) {
-        // We don't know where the leader is
         fprintf(stderr, "forward_submit_to_leader: unknown leader node ID %u\n", n->cfg.leader_id);
         return send_nack(client_fd, NACK_NOT_LEADER);
     }
 
-    // Connect to leader
     int leader_fd = net_connect_tcp(leader->host, leader->port);
     if (leader_fd < 0) {
         fprintf(stderr, "forward_submit_to_leader: failed to connect to leader %s:%u\n",
@@ -148,22 +714,19 @@ static int forward_submit_to_leader(Node *n, int client_fd,
         return send_nack(client_fd, NACK_LEADER_UNREACH);
     }
 
-    net_set_timeouts(leader_fd, 2000, 2000);
+    (void)net_set_timeouts(leader_fd, 2000, 2000);
 
-    // Send submit to leader (same payload)
     if (msg_send(leader_fd, MSG_SUBMIT, payload, payload_len) != 0) {
         net_close(&leader_fd);
         fprintf(stderr, "forward_submit_to_leader: msg_send to leader failed\n");
         return send_nack(client_fd, NACK_LEADER_UNREACH);
     }
 
-    // Receive leader response (expect ACK or NACK)
     uint8_t rtype = 0, rver = 0;
     uint8_t *rpayload = NULL;
     size_t rpayload_len = 0;
 
     MsgResult rr = msg_recv(leader_fd, &rtype, &rver, &rpayload, &rpayload_len);
-
     net_close(&leader_fd);
 
     if (rr != MSG_OK || rver != MSG_VERSION) {
@@ -172,8 +735,6 @@ static int forward_submit_to_leader(Node *n, int client_fd,
         return send_nack(client_fd, NACK_LEADER_UNREACH);
     }
 
-    // Relay leader response to client
-    // We forward ACK/NACK exactly as leader produced it.
     if (rtype != MSG_ACK && rtype != MSG_NACK) {
         free(rpayload);
         fprintf(stderr, "forward_submit_to_leader: unexpected response type %u from leader\n", rtype);
@@ -185,7 +746,6 @@ static int forward_submit_to_leader(Node *n, int client_fd,
     return rc;
 }
 
-// Handle MSG_SUBMIT: client asks this node to create+sign+append entry.
 static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload_len)
 {
     uint32_t event_type = 0, player_id = 0;
@@ -193,60 +753,44 @@ static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload
     uint16_t desc_len = 0;
     uint64_t client_nonce = 0;
 
-    // If not leader, forward to leader node
     if (!node_is_leader(n)) {
         return forward_submit_to_leader(n, fd, payload, payload_len);
     }
 
     if (msg_parse_submit_payload(payload, payload_len,
-                                &event_type, &player_id,
-                                &desc, &desc_len,
-                                &client_nonce) != 0)
-    {
+                                 &event_type, &player_id,
+                                 &desc, &desc_len,
+                                 &client_nonce) != 0) {
         return send_nack(fd, NACK_BAD_FORMAT);
     }
 
-    // Enforce your entry constraints
     if (desc_len >= DESCRIPTION_MAX) {
         return send_nack(fd, NACK_BAD_FORMAT);
     }
 
-    // Ensure keys are loaded (root pub + current priv)
-    // (Call once in node_create ideally; this is safe too)
     if (load_or_create_keys(n->cfg.pub_path, n->cfg.priv_path) != 0) {
         return send_nack(fd, NACK_INTERNAL_ERROR);
     }
 
     uint8_t prev_hash[HASH_SIZE] = {0};
-    uint8_t existing_hash[HASH_SIZE];
+    uint64_t new_log_index = 1;
+    uint8_t existing_hash[HASH_SIZE] = {0};
 
     pthread_mutex_lock(&n->lock);
 
     int already = idem_get(&n->idem_table, n->cfg.node_id, client_nonce, existing_hash);
     if (already == 1) {
-        // already processed this nonce for this node
         pthread_mutex_unlock(&n->lock);
-        fprintf(stderr, "handle_submit: duplicate nonce %lu from client\n", (unsigned long)client_nonce);
-        return send_ack(fd, existing_hash);
+        return leader_retry_duplicate(n, fd, client_nonce, existing_hash);
     }
 
-    if (n->has_last_hash) {
-        memcpy(prev_hash, n->last_hash, HASH_SIZE);
-    } else {
-        // try load last hash from disk
-        LogEntry last;
-        if (fileio_read_last(n->cfg.log_path, &last) == 0) {
-            memcpy(prev_hash, last.entry_hash, HASH_SIZE);
-            memcpy(n->last_hash, last.entry_hash, HASH_SIZE);
-            n->has_last_hash = 1;
-        }
+    if (node_get_tip_locked(n, prev_hash, &new_log_index) != 0) {
+        pthread_mutex_unlock(&n->lock);
+        return send_nack(fd, NACK_INTERNAL_ERROR);
     }
 
     pthread_mutex_unlock(&n->lock);
 
-    // Create entry (timestamp comes from node; client nonce not yet integrated in your LogEntry)
-    // For now, you can include nonce in description prefix if you want idempotency later.
-    // Better: add nonce field to LogEntry soon.
     char desc_buf[DESCRIPTION_MAX];
     memcpy(desc_buf, desc, desc_len);
     desc_buf[desc_len] = '\0';
@@ -255,27 +799,37 @@ static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload
         util_timestamp_now(),
         n->cfg.node_id,
         client_nonce,
+        new_log_index,
         event_type,
         player_id,
         desc_buf,
         prev_hash
     );
 
-    entry_compute_hash(&entry, entry.entry_hash);
-    do_sign(entry.entry_hash, entry.signature);
-
-    // Serialize for disk + network
-    uint8_t entry_bytes[2048];
-    size_t entry_len = entry_serialize(&entry, entry_bytes, sizeof(entry_bytes));
-    if (entry_len == 0) {
+    if (entry_compute_hash(&entry, entry.entry_hash) != 0) {
+        return send_nack(fd, NACK_INTERNAL_ERROR);
+    }
+    if (do_sign(entry.entry_hash, entry.signature) != 0) {
         return send_nack(fd, NACK_INTERNAL_ERROR);
     }
 
-    // Append and update shared state under lock
     pthread_mutex_lock(&n->lock);
 
-    // Chain check again under lock (ensures no race with another append)
-    if (n->has_last_hash && memcmp(entry.prev_hash, n->last_hash, HASH_SIZE) != 0) {
+    already = idem_get(&n->idem_table, n->cfg.node_id, client_nonce, existing_hash);
+    if (already == 1) {
+        pthread_mutex_unlock(&n->lock);
+        return leader_retry_duplicate(n, fd, client_nonce, existing_hash);
+    }
+
+    uint8_t current_prev_hash[HASH_SIZE] = {0};
+    uint64_t current_next_index = 1;
+    if (node_get_tip_locked(n, current_prev_hash, &current_next_index) != 0) {
+        pthread_mutex_unlock(&n->lock);
+        return send_nack(fd, NACK_INTERNAL_ERROR);
+    }
+
+    if (memcmp(entry.prev_hash, current_prev_hash, HASH_SIZE) != 0 ||
+        entry.log_index != current_next_index) {
         pthread_mutex_unlock(&n->lock);
         return send_nack(fd, NACK_DOES_NOT_EXTEND_CHAIN);
     }
@@ -287,116 +841,156 @@ static int handle_submit(Node *n, int fd, const uint8_t *payload, size_t payload
 
     memcpy(n->last_hash, entry.entry_hash, HASH_SIZE);
     n->has_last_hash = 1;
+    n->last_index = entry.log_index;
+    n->has_last_index = 1;
 
-    idem_put(&n->idem_table, entry.author_node_id, entry.nonce, entry.entry_hash);
+    (void)idem_put(&n->idem_table, entry.author_node_id, entry.nonce, entry.entry_hash);
 
     pthread_mutex_unlock(&n->lock);
 
-    // Broadcast outside lock (don’t block other threads)
-    broadcast_entry(n, entry_bytes, entry_len);
+    if (replicate_to_quorum(n, entry.log_index, entry.entry_hash) != 0) {
+        return send_nack(fd, NACK_QUORUM_NOT_REACHED);
+    }
 
+    node_schedule_async_fanout(n, entry.log_index, entry.entry_hash);
     return send_ack(fd, entry.entry_hash);
 }
 
-// Handle MSG_ENTRY: peer propagates a fully formed entry (already signed).
-static int handle_entry(Node *n, int fd, const uint8_t *payload, size_t payload_len)
+static int handle_repl_entry(Node *n, int fd, const uint8_t *payload, size_t payload_len)
 {
     const uint8_t *entry_bytes = NULL;
     size_t entry_len = 0;
 
     if (msg_parse_entry_payload(payload, payload_len, &entry_bytes, &entry_len) != 0) {
-        return send_nack(fd, NACK_BAD_FORMAT);
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_BAD_FORMAT);
     }
 
     LogEntry e;
     if (entry_deserialize(&e, entry_bytes, entry_len) != 0) {
-        return send_nack(fd, NACK_BAD_FORMAT);
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_BAD_FORMAT);
     }
 
-    // Ignore self-originated entries (prevents accidental loops)
-    if (e.author_node_id == n->cfg.node_id) {
-        return send_nack(fd, NACK_DUPLICATE); // or just return 0
-    }
-
-    // Verify signature and hash correctness.
-    // Note: do_verify() uses whatever pubkey is currently loaded in memory.
-    // In a true multi-node setup, you should verify using the SENDER/AUTHOR node's pubkey.
-    // For now (v1), assume a shared root key or same keys for all nodes, or extend crypto API.
     uint8_t expected_hash[HASH_SIZE];
-    entry_compute_hash(&e, expected_hash);
-    if (memcmp(expected_hash, e.entry_hash, HASH_SIZE) != 0) {
-        return send_nack(fd, NACK_BAD_FORMAT);
+    if (entry_compute_hash(&e, expected_hash) != 0 ||
+        memcmp(expected_hash, e.entry_hash, HASH_SIZE) != 0) {
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, e.log_index, zeros, REPL_NACK_BAD_FORMAT);
     }
-
-    // if (do_verify(e.entry_hash, e.signature) != 0) {
-    //     return send_nack(fd, NACK_BAD_SIGNATURE);
-    // }
 
     const uint8_t *pub = peers_get_pubkey(&n->peers, e.author_node_id);
     if (!pub) {
-        fprintf(stderr, "handle_entry: unknown peer author_node_id %u\n", e.author_node_id);
-        return send_nack(fd, NACK_UNKNOWN_PEER);
-    }
-    if (do_verify_with_pub(e.entry_hash, e.signature, pub) != 0) {
-        fprintf(stderr, "handle_entry: bad signature from author_node_id %u\n", e.author_node_id);
-        return send_nack(fd, NACK_BAD_SIGNATURE);
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, e.log_index, zeros, REPL_NACK_UNKNOWN_PEER);
     }
 
-    // Serialize check: already have bytes; we append the LogEntry using fileio_append_entry
-    // which will serialize again. That’s OK for v1 simplicity.
+    if (do_verify_with_pub(e.entry_hash, e.signature, pub) != 0) {
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, e.log_index, zeros, REPL_NACK_BAD_SIGNATURE);
+    }
+
     pthread_mutex_lock(&n->lock);
 
-    if (idem_get(&n->idem_table, e.author_node_id, e.nonce, NULL) == 1) {
+    uint8_t expected_prev_hash[HASH_SIZE] = {0};
+    uint64_t expected_index = 1;
+
+    if (node_get_tip_locked(n, expected_prev_hash, &expected_index) != 0) {
         pthread_mutex_unlock(&n->lock);
-        return send_nack(fd, NACK_DUPLICATE);
-    }
-
-    // Load last hash if needed
-    if (!n->has_last_hash) {
-        LogEntry last;
-        if (fileio_read_last(n->cfg.log_path, &last) == 0) {
-            memcpy(n->last_hash, last.entry_hash, HASH_SIZE);
-            n->has_last_hash = 1;
-        }
-    }
-
-    // Chain check (simple v1 rule: must extend local tip)
-    if (n->has_last_hash) {
-        if (memcmp(e.prev_hash, n->last_hash, HASH_SIZE) != 0) {
-            pthread_mutex_unlock(&n->lock);
-            return send_nack(fd, NACK_DOES_NOT_EXTEND_CHAIN);
-        }
-    } else {
-        // empty log: accept genesis only if prev_hash is zero
         uint8_t zeros[HASH_SIZE] = {0};
-        if (memcmp(e.prev_hash, zeros, HASH_SIZE) != 0) {
+        return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_INTERNAL_ERROR);
+    }
+
+    if (e.log_index < expected_index) {
+        LogEntry local_at_index;
+        if (node_lookup_entry_by_index_locked(n, e.log_index, &local_at_index) != 0) {
+            uint8_t tip_hash[HASH_SIZE] = {0};
+            memcpy(tip_hash, expected_prev_hash, HASH_SIZE);
             pthread_mutex_unlock(&n->lock);
-            return send_nack(fd, NACK_DOES_NOT_EXTEND_CHAIN);
+            return send_repl_ack(fd, 0, expected_index, tip_hash, REPL_NACK_INDEX_MISMATCH);
+        }
+
+        if (memcmp(local_at_index.entry_hash, e.entry_hash, HASH_SIZE) == 0) {
+            // Entry already matches. If we have extra tail beyond this point, trim it.
+            if (expected_index > e.log_index + 1) {
+                if (fileio_truncate_after(n->cfg.log_path, e.log_index) != 0 ||
+                    node_reload_state_from_disk_locked(n) != 0) {
+                    pthread_mutex_unlock(&n->lock);
+                    uint8_t zeros[HASH_SIZE] = {0};
+                    return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_INTERNAL_ERROR);
+                }
+            }
+
+            pthread_mutex_unlock(&n->lock);
+            return send_repl_ack(fd, 1, e.log_index, e.entry_hash, 0);
+        }
+
+        // Divergence at this index: rollback and replay from leader.
+        if (e.log_index == 0 ||
+            fileio_truncate_after(n->cfg.log_path, e.log_index - 1) != 0 ||
+            node_reload_state_from_disk_locked(n) != 0) {
+            pthread_mutex_unlock(&n->lock);
+            uint8_t zeros[HASH_SIZE] = {0};
+            return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_INTERNAL_ERROR);
+        }
+
+        if (node_get_tip_locked(n, expected_prev_hash, &expected_index) != 0) {
+            pthread_mutex_unlock(&n->lock);
+            uint8_t zeros[HASH_SIZE] = {0};
+            return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_INTERNAL_ERROR);
         }
     }
 
-    // Append
+    uint8_t existing_hash[HASH_SIZE] = {0};
+    int dup = idem_get(&n->idem_table, e.author_node_id, e.nonce, existing_hash);
+    if (dup == 1) {
+        pthread_mutex_unlock(&n->lock);
+
+        if (memcmp(existing_hash, e.entry_hash, HASH_SIZE) == 0) {
+            return send_repl_ack(fd, 1, e.log_index, e.entry_hash, 0);
+        }
+        return send_repl_ack(fd, 0, e.log_index, existing_hash, REPL_NACK_DUPLICATE);
+    }
+    if (dup < 0) {
+        pthread_mutex_unlock(&n->lock);
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, 0, zeros, REPL_NACK_INTERNAL_ERROR);
+    }
+
+    if (e.log_index > expected_index) {
+        uint8_t tip_hash[HASH_SIZE] = {0};
+        memcpy(tip_hash, expected_prev_hash, HASH_SIZE);
+        pthread_mutex_unlock(&n->lock);
+        return send_repl_ack(fd, 0, expected_index, tip_hash, REPL_NACK_INDEX_MISMATCH);
+    }
+
+    if (memcmp(e.prev_hash, expected_prev_hash, HASH_SIZE) != 0) {
+        uint8_t tip_hash[HASH_SIZE] = {0};
+        memcpy(tip_hash, expected_prev_hash, HASH_SIZE);
+        pthread_mutex_unlock(&n->lock);
+        return send_repl_ack(fd, 0, expected_index, tip_hash, REPL_NACK_DOES_NOT_EXTEND_CHAIN);
+    }
+
     if (fileio_append_entry(n->cfg.log_path, &e) != 0) {
         pthread_mutex_unlock(&n->lock);
-        return send_nack(fd, NACK_INTERNAL_ERROR);
+        uint8_t zeros[HASH_SIZE] = {0};
+        return send_repl_ack(fd, 0, expected_index, zeros, REPL_NACK_INTERNAL_ERROR);
     }
 
     memcpy(n->last_hash, e.entry_hash, HASH_SIZE);
     n->has_last_hash = 1;
+    n->last_index = e.log_index;
+    n->has_last_index = 1;
 
-    idem_put(&n->idem_table, e.author_node_id, e.nonce, e.entry_hash);
+    (void)idem_put(&n->idem_table, e.author_node_id, e.nonce, e.entry_hash);
 
     pthread_mutex_unlock(&n->lock);
 
-    // In v1, you can either ACK or just ignore.
-    // ACK is useful for debugging.
-    //return send_ack(fd, e.entry_hash);
-    return 0;
+    return send_repl_ack(fd, 1, e.log_index, e.entry_hash, 0);
 }
 
 static int handle_pubkey_req(Node *n, int fd)
 {
-    // Ensure keys loaded (should already be in node_create, but safe)
     if (load_or_create_keys(n->cfg.pub_path, n->cfg.priv_path) != 0) {
         fprintf(stderr, "handle_pubkey_req: failed to load or create keys\n");
         return send_nack(fd, NACK_INTERNAL_ERROR);
@@ -408,9 +1002,6 @@ static int handle_pubkey_req(Node *n, int fd)
 
     return msg_send(fd, MSG_PUBKEY_RESP, payload, sizeof(payload));
 }
-
-
-// ---------- Connection thread ----------
 
 static void *conn_thread_main(void *arg)
 {
@@ -446,8 +1037,8 @@ static void *conn_thread_main(void *arg)
             case MSG_SUBMIT:
                 (void)handle_submit(n, fd, payload, payload_len);
                 break;
-            case MSG_ENTRY:
-                (void)handle_entry(n, fd, payload, payload_len);
+            case MSG_REPL_ENTRY:
+                (void)handle_repl_entry(n, fd, payload, payload_len);
                 break;
             case MSG_PUBKEY_REQ:
                 (void)handle_pubkey_req(n, fd);
@@ -458,16 +1049,12 @@ static void *conn_thread_main(void *arg)
         }
 
         free(payload);
-
-        // We expect exactly one request per connection in v1:
         break;
     }
 
     net_close(&fd);
     return NULL;
 }
-
-// ---------- Public Node API ----------
 
 int node_submit_local(Node *n,
                       uint32_t event_type,
@@ -477,7 +1064,7 @@ int node_submit_local(Node *n,
                       uint64_t client_nonce,
                       uint8_t out_hash[HASH_SIZE])
 {
-    if (!n || (!desc && desc_len > 0)) {
+    if (!n || (!desc && desc_len > 0) || !out_hash) {
         fprintf(stderr, "node_submit_local: invalid arguments\n");
         return -1;
     }
@@ -485,47 +1072,32 @@ int node_submit_local(Node *n,
         fprintf(stderr, "node_submit_local: description too long\n");
         return -1;
     }
-    if (!out_hash) {
-        fprintf(stderr, "node_submit_local: out_hash is NULL\n");
-        return -1;
-    }
 
-    // Ensure keys are loaded (safe even if already loaded)
     if (load_or_create_keys(n->cfg.pub_path, n->cfg.priv_path) != 0) {
         fprintf(stderr, "node_submit_local: failed to load or create keys\n");
         return -1;
     }
 
     uint8_t prev_hash[HASH_SIZE] = {0};
-    uint8_t existing_hash[HASH_SIZE];
+    uint64_t new_log_index = 1;
+    uint8_t existing_hash[HASH_SIZE] = {0};
 
-    // ---- lock: idempotency + determine prev_hash ----
     pthread_mutex_lock(&n->lock);
 
     int already = idem_get(&n->idem_table, n->cfg.node_id, client_nonce, existing_hash);
     if (already == 1) {
         memcpy(out_hash, existing_hash, HASH_SIZE);
         pthread_mutex_unlock(&n->lock);
-        return 1; // duplicate
+        return 1;
     }
 
-    if (n->has_last_hash) {
-        memcpy(prev_hash, n->last_hash, HASH_SIZE);
-    } else {
-        LogEntry last;
-        if (fileio_read_last(n->cfg.log_path, &last) == 0) {
-            memcpy(prev_hash, last.entry_hash, HASH_SIZE);
-            memcpy(n->last_hash, last.entry_hash, HASH_SIZE);
-            n->has_last_hash = 1;
-
-            // Optional: seed idem table from last entry only (you already do this in node_create)
-            // idem_put(&n->idem_table, last.author_node_id, last.nonce, last.entry_hash);
-        }
+    if (node_get_tip_locked(n, prev_hash, &new_log_index) != 0) {
+        pthread_mutex_unlock(&n->lock);
+        return -1;
     }
 
     pthread_mutex_unlock(&n->lock);
 
-    // ---- build entry ----
     char desc_buf[DESCRIPTION_MAX];
     if (desc_len > 0) {
         memcpy(desc_buf, desc, desc_len);
@@ -536,6 +1108,7 @@ int node_submit_local(Node *n,
         util_timestamp_now(),
         n->cfg.node_id,
         client_nonce,
+        new_log_index,
         event_type,
         player_id,
         desc_buf,
@@ -551,40 +1124,43 @@ int node_submit_local(Node *n,
         return -1;
     }
 
-    // ---- lock: chain check + append + update shared state + idem_put ----
     pthread_mutex_lock(&n->lock);
 
-    // Re-check idempotency to avoid race if you ever call this concurrently
     already = idem_get(&n->idem_table, n->cfg.node_id, client_nonce, existing_hash);
     if (already == 1) {
         memcpy(out_hash, existing_hash, HASH_SIZE);
         pthread_mutex_unlock(&n->lock);
-        fprintf(stderr, "node_submit_local: duplicate detected on re-check\n");
         return 1;
     }
 
-    // Chain check (must extend current tip)
-    if (n->has_last_hash && memcmp(entry.prev_hash, n->last_hash, HASH_SIZE) != 0) {
+    uint8_t current_prev_hash[HASH_SIZE] = {0};
+    uint64_t current_next_index = 1;
+    if (node_get_tip_locked(n, current_prev_hash, &current_next_index) != 0) {
         pthread_mutex_unlock(&n->lock);
-        fprintf(stderr, "node_submit_local: entry does not extend chain\n");
+        return -1;
+    }
+
+    if (memcmp(entry.prev_hash, current_prev_hash, HASH_SIZE) != 0 ||
+        entry.log_index != current_next_index) {
+        pthread_mutex_unlock(&n->lock);
         return -1;
     }
 
     if (fileio_append_entry(n->cfg.log_path, &entry) != 0) {
         pthread_mutex_unlock(&n->lock);
-        fprintf(stderr, "node_submit_local: failed to append entry to log\n");
         return -1;
     }
 
     memcpy(n->last_hash, entry.entry_hash, HASH_SIZE);
     n->has_last_hash = 1;
+    n->last_index = entry.log_index;
+    n->has_last_index = 1;
 
-    idem_put(&n->idem_table, entry.author_node_id, entry.nonce, entry.entry_hash);
+    (void)idem_put(&n->idem_table, entry.author_node_id, entry.nonce, entry.entry_hash);
 
     pthread_mutex_unlock(&n->lock);
 
     memcpy(out_hash, entry.entry_hash, HASH_SIZE);
-
     return 0;
 }
 
@@ -598,7 +1174,7 @@ Node *node_create(const NodeConfig *cfg)
         return NULL;
     }
 
-    if (idem_init(&n->idem_table, 4096) != 0) {  // 4096 slots to start
+    if (idem_init(&n->idem_table, 4096) != 0) {
         node_destroy(n);
         fprintf(stderr, "node_create: failed to init idem table.. destroyed node.\n");
         return NULL;
@@ -607,8 +1183,12 @@ Node *node_create(const NodeConfig *cfg)
     n->cfg = *cfg;
     n->listen_fd = -1;
     pthread_mutex_init(&n->lock, NULL);
+    n->lock_inited = 1;
+    pthread_mutex_init(&n->fanout_lock, NULL);
+    n->fanout_lock_inited = 1;
+    pthread_cond_init(&n->fanout_cv, NULL);
+    n->fanout_cv_inited = 1;
 
-    // Preload keys for this node process
     if (load_or_create_keys(n->cfg.pub_path, n->cfg.priv_path) != 0) {
         node_destroy(n);
         fprintf(stderr, "node_create: failed to load or create keys.. destroyed node.\n");
@@ -623,13 +1203,19 @@ Node *node_create(const NodeConfig *cfg)
         }
     }
 
-    // Rebuild idempotency + tip from disk.
-    // max_entries_to_load = 0 means "load all". Capping at 4096 currently, but
-    //   adjust as needed.
     if (node_seed_idempotency_from_log(n, 4096) != 0) {
         fprintf(stderr, "node_create: failed to seed idempotency from log\n");
         node_destroy(n);
         return NULL;
+    }
+
+    if (node_is_leader(n)) {
+        if (pthread_create(&n->fanout_tid, NULL, fanout_thread_main, n) != 0) {
+            fprintf(stderr, "node_create: failed to start fanout thread\n");
+            node_destroy(n);
+            return NULL;
+        }
+        n->fanout_thread_started = 1;
     }
 
     return n;
@@ -671,7 +1257,6 @@ int node_run(Node *n)
             continue;
         }
 
-        // Detached threads so we don’t have to join
         pthread_detach(tid);
     }
 
@@ -682,14 +1267,31 @@ void node_destroy(Node *n)
 {
     if (!n) return;
 
+    if (n->fanout_thread_started && n->fanout_lock_inited) {
+        pthread_mutex_lock(&n->fanout_lock);
+        n->fanout_stop = 1;
+        if (n->fanout_cv_inited) {
+            pthread_cond_signal(&n->fanout_cv);
+        }
+        pthread_mutex_unlock(&n->fanout_lock);
+        pthread_join(n->fanout_tid, NULL);
+    }
+
     if (n->listen_fd >= 0) {
         net_close(&n->listen_fd);
     }
 
     peers_free(&n->peers);
-
     idem_free(&n->idem_table);
 
-    pthread_mutex_destroy(&n->lock);
+    if (n->fanout_cv_inited) {
+        pthread_cond_destroy(&n->fanout_cv);
+    }
+    if (n->fanout_lock_inited) {
+        pthread_mutex_destroy(&n->fanout_lock);
+    }
+    if (n->lock_inited) {
+        pthread_mutex_destroy(&n->lock);
+    }
     free(n);
 }
