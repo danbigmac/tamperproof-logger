@@ -13,7 +13,7 @@ void test_fileio(void)
     uint8_t prev_hash[HASH_SIZE] = {0};
 
     // Build entry 1
-    LogEntry e1 = entry_create(util_timestamp_now(), 1, 10, "first", prev_hash);
+    LogEntry e1 = entry_create(util_timestamp_now(), 42 /*author*/, 12345ULL /*nonce*/, 1 /*log_index*/, 1, 10, "first", prev_hash);
     entry_compute_hash(&e1, e1.entry_hash);
     do_sign(e1.entry_hash, e1.signature);
     TEST_ASSERT(fileio_append_entry(path, &e1) == 0);
@@ -24,7 +24,7 @@ void test_fileio(void)
     TEST_ASSERT(memcmp(last.entry_hash, e1.entry_hash, HASH_SIZE) == 0);
 
     // Append entry 2
-    LogEntry e2 = entry_create(util_timestamp_now(), 2, 20, "second", e1.entry_hash);
+    LogEntry e2 = entry_create(util_timestamp_now(), 42 /*author*/, 12346ULL /*nonce*/, 2 /*log_index*/, 2, 20, "second", e1.entry_hash);
     entry_compute_hash(&e2, e2.entry_hash);
     do_sign(e2.entry_hash, e2.signature);
     TEST_ASSERT(fileio_append_entry(path, &e2) == 0);

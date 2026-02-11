@@ -95,7 +95,14 @@ int do_sign(const uint8_t hash[32], uint8_t sig_out[64])
     //return 0;
 }
 
+int do_verify_with_pub(const uint8_t hash[32], const uint8_t sig[64],
+                       const uint8_t pub[crypto_sign_PUBLICKEYBYTES])
+{
+    return crypto_sign_verify_detached(sig, hash, 32, pub);
+}
+
 int do_verify(const uint8_t hash[32], const uint8_t sig[64])
 {
-    return crypto_sign_verify_detached(sig, hash, 32, PUBLIC_KEY);
+    //return crypto_sign_verify_detached(sig, hash, 32, PUBLIC_KEY);
+    return do_verify_with_pub(hash, sig, PUBLIC_KEY);
 }

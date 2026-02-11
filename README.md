@@ -1,66 +1,114 @@
-A lightweight, cryptographically secure, append-only event logger written in C.
-It uses a custom binary format, hash chaining, and Ed25519 signatures to ensure that once data is written, it cannot be modified or reordered without detection.
-The project was originally designed around sports event data (timestamps, event types, player IDs, descriptions), but the structure is just an example - you can plug in any type of event data you want. The core idea is the same: provide a verifiable, tamper-evident log.
-Still adding more features...
+# Tamperproof Logger
 
+A lightweight, cryptographically secure append-only log in C with both local and distributed modes.
 
-Some features:
+It uses:
+- Hash chaining (`prev_hash`)
+- Ed25519 signatures (libsodium)
+- CRC32 integrity checks
+- Explicit `log_index` per entry
+- Leader/follower replication with quorum ACK
 
-- Append-only binary file format with length prefix & suffix.
-- Cryptographic hash chaining
-    - Each log entry stores the previous entry’s hash, forming a linked chain of integrity.
-- Digital signatures (Ed25519 via libsodium)
-    - Ensures every entry is authentic and was created by the holder of the private key.
-- CRC32 checks for accidental corruption
-- O(1) “read last entry” lookup
-    - Enabled by footer-based length.
-- Full verification
-    - Detects tampering, corruption, reordering, or unsigned entries.
+## Current Status
 
+This project now supports a distributed leader-based replication flow.
 
-Example usage:
+Current behavior:
+- Client submits to any node.
+- Non-leader forwards to leader.
+- Leader appends locally, then replicates.
+- Leader returns `ACK` only after quorum is reached.
+- After quorum ACK, leader continues asynchronous fanout retries to bring remaining followers up to date.
+- Followers enforce chain extension and `log_index` continuity, and can truncate/replay to repair divergence.
 
-Build it:
+## Build
 
+```bash
 make
+```
 
-Print usage:
+Run unit tests:
 
-./build/logger
+```bash
+make test
+```
 
-Add an entry:
+Run cluster integration scenarios:
 
-./build/logger add score 23 "Hit a three-pointer"
+```bash
+./scripts/cluster_integration_tests.sh --scenario all --verbose
+```
 
-This command loads (or generates) signing keys, creates a new log entry, chains it to the previous entry, computes a hash, signs it, appends it to data/game.log.
+## CLI Commands
 
-Print entries:
+Local log commands:
+- `./build/logger add <event_type> <player_id> <description> [--author N] [--nonce N] [--log PATH] [--pub PATH] [--priv PATH]`
+- `./build/logger print [logfile] [--log PATH]`
+- `./build/logger verify [logfile] [--log PATH] [--pub PATH] [--priv PATH]`
+- `./build/logger verify-local --leader-id N [--log PATH] [--pub PATH] [--priv PATH]`
+- `./build/logger verify-peers --peers PATH [--log PATH]`
+- `./build/logger rotate_keys [--author N] [--nonce N] [--log PATH] [--pub PATH] [--priv PATH]`
 
-./build/logger print
+Distributed commands:
+- `./build/logger node --node-id N --leader-id N --listen HOST:PORT --log PATH --pub PATH --priv PATH --peers PATH`
+- `./build/logger submit --host HOST --port PORT --event EVENT --player ID --desc TEXT [--nonce N]`
+- `./build/logger show-pub --pub PATH`
+- `./build/logger show-pub --host HOST --port PORT`
 
-You’ll see output like:
+## peers.conf Format
 
-Entry 0:
-  time:   1733440100
-  player: 23
-  type:   SCORE
-  desc:   Hit a three-pointer
+One peer per line:
 
+`<node_id> <host> <port> <pubkey_hex>`
 
-Verify the entire log:
+Example:
+`1 127.0.0.1 21596 <64-hex-char-ed25519-pubkey>`
 
-./build/logger verify
+Important:
+- `peers.conf` must include the leader itself.
+- All nodes should have the same `peers.conf`.
 
-If the log has not been tampered with, you'll see output: "Log verified: all entries valid."
+## Replication Semantics (Current)
 
-If you flip even one byte in the file, verification will detect it immediately.
+- Quorum is `floor(N/2) + 1`, where `N` is total nodes in `peers.conf` (including leader).
+- Leader counts its own local append as one ACK.
+- If quorum is not reached, client gets `NACK_QUORUM_NOT_REACHED`.
+- On success, client gets `ACK` after quorum, not after all followers.
+- Remaining followers are retried asynchronously until convergence.
+- Follower-side replication ACK includes `ok`, `log_index`, `entry_hash`, and optional reason code.
 
+## NACK Codes
 
-The built-in event structure uses:
+Client NACK reasons:
+- `1` bad signature
+- `2` bad format
+- `3` does not extend chain
+- `4` duplicate
+- `5` internal error
+- `6` unknown peer
+- `7` not leader
+- `8` leader unreachable
+- `9` quorum not reached
 
-timestamp, 
-event_type (e.g., SCORE / FOUL / SUB), 
-player_id, 
-description
+Replication NACK reasons:
+- `1` bad format
+- `2` bad signature
+- `3` does not extend chain
+- `4` duplicate
+- `5` internal error
+- `6` unknown peer
+- `7` index mismatch
 
-This made sense for the sports-related experiments I wanted to play with - but the logger itself is generic and can support any event format. You can replace the fields, add new ones, or build an entirely different record schema without changing the core logging/verification pipeline.
+## Integration Test Scenarios
+
+`./scripts/cluster_integration_tests.sh` currently covers:
+- `happy`: 3-node quorum replication + convergence
+- `quorum`: fail-then-retry duplicate path
+- `repair`: follower divergence truncate+replay repair
+
+## Known Limitations
+
+- No full Raft term/commit-index protocol yet.
+- No snapshot/install-snapshot flow yet.
+- Catch-up/repair exists, but not full consensus state machine semantics.
+- Backward compatibility of old log formats/protocol versions is not currently a goal.

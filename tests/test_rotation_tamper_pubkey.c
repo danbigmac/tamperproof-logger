@@ -24,6 +24,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     LogEntry *entries = fileio_read_all(log_path, &count);
     if (!entries || count == 0) {
         free(entries);
+        fprintf(stderr, "tamper: failed to read log entries\n");
         return -1;
     }
 
@@ -46,7 +47,10 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     // Because entries are variable-size, we re-scan the file by reading the prefix lengths
     // and summing total sizes until we reach rot_i.
     FILE *f = fopen(log_path, "r+b");
-    if (!f) return -1;
+    if (!f) {
+        fprintf(stderr, "tamper: failed to open log file\n");
+        return -1;
+    }
 
     long rot_offset = 0;
 
@@ -54,6 +58,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
         uint8_t prefix[ENTRY_LENGTH_PREFIX_SIZE];
         if (fread(prefix, 1, ENTRY_LENGTH_PREFIX_SIZE, f) != ENTRY_LENGTH_PREFIX_SIZE) {
             fclose(f);
+            fprintf(stderr, "tamper: failed to read entry prefix\n");
             return -1;
         }
         uint32_t body_size = read_u32_le(prefix);
@@ -62,6 +67,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
         // skip remainder of this entry (we already consumed prefix)
         if (fseek(f, total_size - ENTRY_LENGTH_PREFIX_SIZE, SEEK_CUR) != 0) {
             fclose(f);
+            fprintf(stderr, "tamper: failed to seek to next entry\n");
             return -1;
         }
 
@@ -73,6 +79,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     uint8_t prefix[ENTRY_LENGTH_PREFIX_SIZE];
     if (fread(prefix, 1, ENTRY_LENGTH_PREFIX_SIZE, f) != ENTRY_LENGTH_PREFIX_SIZE) {
         fclose(f);
+        fprintf(stderr, "tamper: failed to read rotation entry prefix\n");
         return -1;
     }
     uint32_t body_size = read_u32_le(prefix);
@@ -84,6 +91,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     if (fread(body, 1, body_size, f) != body_size) {
         free(body);
         fclose(f);
+        fprintf(stderr, "tamper: failed to read rotation entry body\n");
         return -1;
     }
 
@@ -91,6 +99,8 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     // timestamp(8) event_type(4) player_id(4) desc_len(2) desc(dlen) prev_hash(32) entry_hash(32) sig(64)
     size_t off = 0;
     off += TIMESTAMP_SIZE;
+    off += AUTHOR_NODE_ID_SIZE;
+    off += NONCE_SIZE;
     off += EVENT_TYPE_SIZE;
     off += PLAYER_ID_SIZE;
 
@@ -101,6 +111,7 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     if (dlen < 2) {
         free(body);
         fclose(f);
+        fprintf(stderr, "tamper: rotation entry description too short\n");
         return -1;
     }
 
@@ -122,12 +133,14 @@ static int tamper_rotation_pubkey_hex_in_file(const char *log_path)
     if (fseek(f, body_start_pos, SEEK_SET) != 0) {
         free(body);
         fclose(f);
+        fprintf(stderr, "tamper: failed to seek to body start\n");
         return -1;
     }
 
     if (fwrite(body, 1, body_size, f) != body_size) {
         free(body);
         fclose(f);
+        fprintf(stderr, "tamper: failed to write tampered body\n");
         return -1;
     }
 
@@ -148,12 +161,12 @@ void test_rotation_pubkey_tamper_detected(void)
     TEST_ASSERT(load_or_create_keys(pub_path, priv_path) == 0);
 
     // Add some initial entries with root signing key
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SCORE, 23, "root: score") == 0);
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_FOUL,  12, "root: foul") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12345ULL /*nonce*/, (uint32_t)EVENT_SCORE, 23, "root: score") == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12346ULL /*nonce*/, (uint32_t)EVENT_FOUL,  12, "root: foul") == 0);
 
     // Rotate once and add one post-rotation entry
-    TEST_ASSERT(logger_rotate_keys(log_path, priv_path) == 0);
-    TEST_ASSERT(logger_add(log_path, (uint32_t)EVENT_SCORE, 7, "newkey: score") == 0);
+    TEST_ASSERT(logger_rotate_keys(log_path, priv_path, 42 /*author*/, 12347ULL /*nonce*/) == 0);
+    TEST_ASSERT(logger_add(log_path, 42 /*author*/, 12348ULL /*nonce*/, (uint32_t)EVENT_SCORE, 7, "newkey: score") == 0);
 
     // Reset verification to start from root public key in memory
     TEST_ASSERT(load_or_create_keys(pub_path, priv_path) == 0);
